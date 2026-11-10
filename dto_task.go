@@ -23,7 +23,6 @@ type TaskDetailsResponse struct {
 	TaskResponse
 
 	Project     *Project             `json:"project"`
-	Comments    []CommentResponse    `json:"comments"`
 	Attachments []AttachmentResponse `json:"attachments"`
 }
 

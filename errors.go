@@ -31,6 +31,15 @@ var ErrValidation = fmt.Errorf("%w: validation failed", ErrClient)
 // connections, DNS failures and timeouts; it wraps the transport error too.
 var ErrTransport = errors.New("transport error")
 
+// ErrInvalidBaseURL classifies a New call with an empty or whitespace base
+// URL; New rejects it instead of panicking later.
+var ErrInvalidBaseURL = errors.New("base URL must not be empty")
+
+// ErrInvalidCredentials classifies a WithLogin option carrying an empty or
+// whitespace email or password; New rejects it instead of failing at the
+// first request.
+var ErrInvalidCredentials = errors.New("login email and password must not be empty")
+
 // APIError is the typed error returned for every non-2xx API response, parsed
 // from the backend error envelope {message, code?} (details are ignored in v1).
 type APIError struct {

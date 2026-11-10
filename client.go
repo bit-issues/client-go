@@ -9,22 +9,51 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
-// Client is a BitIssues REST API client. Its configuration is immutable after
-// construction, so a Client may be shared by concurrent callers.
+// Client is a BitIssues REST API client. Configuration is immutable after
+// construction; every credential decision (static bearer, per-boot login,
+// refresh, single-flight) is delegated to the embedded session, whose state
+// lives in memory only, so a Client may be shared by concurrent callers.
 type Client struct {
-	config Config
+	baseURL    string
+	httpClient *http.Client
+	session    session
 }
 
-// NewClient returns a client for the API described by config; when the config
-// carries no HTTP client, the default one is used.
-func NewClient(config Config) *Client {
-	if config.HTTPClient == nil {
-		config.HTTPClient = http.DefaultClient
+// New returns a client for baseURL; the /api/v1/... paths are always appended
+// to it. Options configure the HTTP client, a static access token or the
+// per-boot login credentials; an empty or whitespace baseURL is rejected
+// with ErrInvalidBaseURL and an empty WithLogin credential with
+// ErrInvalidCredentials - New never panics.
+func New(baseURL string, opts ...Option) (*Client, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, ErrInvalidBaseURL
 	}
 
-	return &Client{config: config}
+	cfg := clientConfig{
+		httpClient:  &http.Client{},
+		accessToken: "",
+		email:       "",
+		password:    "",
+		loginSet:    false,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.httpClient == nil {
+		cfg.httpClient = &http.Client{}
+	}
+	if cfg.loginSet && (strings.TrimSpace(cfg.email) == "" || strings.TrimSpace(cfg.password) == "") {
+		return nil, ErrInvalidCredentials
+	}
+
+	return &Client{
+		baseURL:    baseURL,
+		httpClient: cfg.httpClient,
+		session:    newSession(baseURL, cfg),
+	}, nil
 }
 
 // Do sends a request for path (joined onto the configured base URL) with the
@@ -32,39 +61,103 @@ func NewClient(config Config) *Client {
 // and is decoded into response when response is not nil and the response has
 // a body; a 204 or empty body is a success without any decode attempt. Any
 // non-2xx response becomes a typed *APIError; network failures wrap
-// ErrTransport.
+// ErrTransport. The bearer credential comes from the session (logging in
+// first when needed); on a 401 the session refreshes at most once
+// (single-flight) and Do retries the original request exactly once, a
+// second 401 is returned as ErrUnauthorized.
 func (c *Client) Do(
 	ctx context.Context,
 	method, path string,
 	query url.Values,
 	payload, response any,
 ) error {
-	req, err := newRequest(ctx, method, requestURL(c.config.BaseURL, path, query), payload, c.config.accessToken)
+	return c.do(ctx, method, path, query, payload, response, false)
+}
+
+// do is the retry-aware request core; it delegates bearer and refresh
+// decisions to the session and marks the single allowed follow-up after a
+// refresh with retried so a second 401 can never loop.
+func (c *Client) do(
+	ctx context.Context,
+	method, path string,
+	query url.Values,
+	payload, response any,
+	retried bool,
+) error {
+	gen, token, bearerErr := c.session.bearer(ctx, c.roundTrip)
+	if bearerErr != nil {
+		return bearerErr
+	}
+
+	status, body, err := c.roundTrip(ctx, method, requestURL(c.baseURL, path, query), payload, token)
 	if err != nil {
 		return err
 	}
 
-	resp, err := c.config.HTTPClient.Do(req)
+	if status == http.StatusUnauthorized && !isAuthPath(path) && !retried {
+		canRetry, refreshErr := c.session.refreshAfterUnauthorized(ctx, gen, c.roundTrip)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if canRetry {
+			return c.do(ctx, method, path, query, payload, response, true)
+		}
+	}
+
+	return finishResponse(status, body, response)
+}
+
+// roundTrip performs one HTTP exchange and returns the status code with the
+// fully read body; the response body is always closed.
+func (c *Client) roundTrip(
+	ctx context.Context,
+	method, urlStr string,
+	payload any,
+	accessToken string,
+) (int, []byte, error) {
+	req, err := newRequest(ctx, method, urlStr, payload, accessToken)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrTransport, err)
+		return 0, nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %w", ErrTransport, err)
 	}
 
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%w: failed to read response body: %w", ErrTransport, err)
+		return 0, nil, fmt.Errorf("%w: failed to read response body: %w", ErrTransport, err)
 	}
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return parseAPIError(resp.StatusCode, body)
+	return resp.StatusCode, body, nil
+}
+
+// finishResponse classifies a non-2xx response or decodes a success body; a
+// 204 and a nil response target succeed without any decode attempt.
+func finishResponse(status int, body []byte, response any) error {
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return parseAPIError(status, body)
 	}
 
-	if resp.StatusCode == http.StatusNoContent || response == nil {
+	if status == http.StatusNoContent || response == nil {
 		return nil
 	}
 
 	return decodeJSONBody(body, response)
+}
+
+// isAuthPath reports whether path is a public auth endpoint; those never
+// take part in the automatic refresh/retry flow.
+func isAuthPath(path string) bool {
+	switch path {
+	case pathAuthLogin, pathAuthRefresh, pathAuthLogout:
+		return true
+	default:
+		return false
+	}
 }
 
 // ListProjects returns all projects and the total count reported by the API.
@@ -141,31 +234,4 @@ func (c *Client) GetTaskDetails(ctx context.Context, id int64) (*TaskDetailsResp
 	}
 
 	return &details, nil
-}
-
-// Login exchanges credentials for an access and refresh token pair plus the user.
-func (c *Client) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
-	var resp LoginResponse
-
-	if err := c.Do(ctx, http.MethodPost, pathAuthLogin, nil, req, &resp); err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-// Refresh exchanges a refresh token for a rotated access and refresh token pair.
-func (c *Client) Refresh(ctx context.Context, req RefreshRequest) (*RefreshResponse, error) {
-	var resp RefreshResponse
-
-	if err := c.Do(ctx, http.MethodPost, pathAuthRefresh, nil, req, &resp); err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-// Logout revokes the refresh token; the API answers 204 with no body.
-func (c *Client) Logout(ctx context.Context, req LogoutRequest) error {
-	return c.Do(ctx, http.MethodPost, pathAuthLogout, nil, req, nil)
 }

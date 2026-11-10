@@ -2,31 +2,44 @@ package clientgo
 
 import "net/http"
 
-// Config configures a Client.
-type Config struct {
-	// BaseURL is the API root URL, e.g. "https://issues.example.com". The
-	// client appends the /api/v1/... paths to it; a trailing slash is
-	// tolerated and path prefixes are preserved.
-	BaseURL string
+// Option configures a Client during New.
+type Option func(*clientConfig)
 
-	// HTTPClient sends the requests; when nil the default HTTP client is used.
-	HTTPClient *http.Client
-
-	// accessToken is sent as a bearer credential on every request when set.
+// clientConfig collects the option values applied by New.
+type clientConfig struct {
+	httpClient  *http.Client
 	accessToken string
+	email       string
+	password    string
+	loginSet    bool
 }
 
-// WithBaseURL returns a copy of the config with the given base URL.
-func (c Config) WithBaseURL(url string) Config {
-	c.BaseURL = url
-
-	return c
+// WithHTTPClient sets the HTTP client used for requests; New falls back to a
+// fresh stdlib [http.Client] when the option is absent or carries nil.
+func WithHTTPClient(httpClient *http.Client) Option {
+	return func(cfg *clientConfig) {
+		cfg.httpClient = httpClient
+	}
 }
 
-// WithJWTAuth returns a copy of the config that sends the access token as an
-// Authorization bearer credential on every request.
-func (c Config) WithJWTAuth(token string) Config {
-	c.accessToken = token
+// WithAccessToken configures a static bearer token (the CI/BITISSUES_TOKEN
+// path): it is attached to every request and the client NEVER logs in or
+// refreshes - a 401 is reported as ErrUnauthorized. It WINS over WithLogin.
+func WithAccessToken(token string) Option {
+	return func(cfg *clientConfig) {
+		cfg.accessToken = token
+	}
+}
 
-	return c
+// WithLogin configures per-boot credentials: the first request that needs a
+// bearer logs in internally (POST /api/v1/auth/login) and keeps both tokens
+// in memory for the lifetime of the process. Nothing is persisted anywhere.
+// New rejects an empty or whitespace email or password with
+// ErrInvalidCredentials.
+func WithLogin(email, password string) Option {
+	return func(cfg *clientConfig) {
+		cfg.loginSet = true
+		cfg.email = email
+		cfg.password = password
+	}
 }

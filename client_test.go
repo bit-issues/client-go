@@ -44,9 +44,7 @@ func TestListProjects(t *testing.T) {
 			`],"total":7}`))
 	}
 
-	client := clientgo.NewClient(
-		clientgo.Config{BaseURL: newStubServer(t, handler) + "/"}.WithJWTAuth("test-token"),
-	)
+	client := mustNew(t, newStubServer(t, handler)+"/", clientgo.WithAccessToken("test-token"))
 
 	items, total, err := client.ListProjects(t.Context())
 
@@ -160,9 +158,7 @@ func TestListTasksSendsAllQueryParams(t *testing.T) {
 			`}],"total":1}`))
 	}
 
-	client := clientgo.NewClient(
-		clientgo.Config{BaseURL: newStubServer(t, handler)}.WithJWTAuth("test-token"),
-	)
+	client := mustNew(t, newStubServer(t, handler), clientgo.WithAccessToken("test-token"))
 
 	params := clientgo.ListTasksParams{
 		Limit:      testListLimit,
@@ -319,8 +315,8 @@ func TestGetTaskByNumber(t *testing.T) {
 	}
 }
 
-// TestGetTaskDetails checks the full details payload with project, comments
-// and attachments, including the presigned download URL kept in the DTO.
+// TestGetTaskDetails checks the full details payload with project and
+// attachments, including the presigned download URL kept in the DTO.
 func TestGetTaskDetails(t *testing.T) {
 	t.Parallel()
 
@@ -343,12 +339,6 @@ func TestGetTaskDetails(t *testing.T) {
 	}
 	if details.Project == nil || details.Project.ID != "backend-service" {
 		t.Errorf("details.Project = %+v, want ID backend-service", details.Project)
-	}
-	if len(details.Comments) != 1 {
-		t.Fatalf("len(details.Comments) = %d, want 1", len(details.Comments))
-	}
-	if details.Comments[0].Content != "ping" {
-		t.Errorf("comments[0].Content = %q, want %q", details.Comments[0].Content, "ping")
 	}
 	if len(details.Attachments) != 1 {
 		t.Fatalf("len(details.Attachments) = %d, want 1", len(details.Attachments))
@@ -375,7 +365,7 @@ func TestBaseURLWithPathPrefix(t *testing.T) {
 		_, _ = w.Write([]byte(`{"items":[],"total":0}`))
 	}
 
-	client := clientgo.NewClient(clientgo.Config{BaseURL: newStubServer(t, handler) + "/bit/"})
+	client := mustNew(t, newStubServer(t, handler)+"/bit/")
 
 	_, _, err := client.ListProjects(t.Context())
 
@@ -436,7 +426,7 @@ func TestGetProjectNotFound(t *testing.T) {
 }
 
 // taskDetailsFixture is the wire payload of GET /api/v1/tasks/{id}: the base
-// task fields plus project, comments and attachments.
+// task fields plus project and attachments.
 const taskDetailsFixture = `{
 	"id": 42,
 	"project_slug": "backend-service",
@@ -458,15 +448,6 @@ const taskDetailsFixture = `{
 		"created_at": "2026-04-01T08:00:00Z",
 		"updated_at": "2026-04-02T09:00:00Z"
 	},
-	"comments": [
-		{
-			"id": 10,
-			"author": {"id": 1, "name": "alice", "role": "admin", "created_at": "2026-01-01T00:00:00Z"},
-			"content": "ping",
-			"created_at": "2026-04-01T10:00:00Z",
-			"updated_at": "2026-04-01T10:00:00Z"
-		}
-	],
 	"attachments": [
 		{
 			"id": 5,
@@ -478,3 +459,32 @@ const taskDetailsFixture = `{
 		}
 	]
 }`
+
+// TestNewRejectsEmptyBaseURL checks New refuses an empty or whitespace base
+// URL with a typed error instead of panicking later.
+func TestNewRejectsEmptyBaseURL(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		baseURL string
+	}{
+		{name: "empty string", baseURL: ""},
+		{name: "whitespace only", baseURL: "   \t\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, err := clientgo.New(tc.baseURL)
+
+			if client != nil {
+				t.Errorf("client = %v, want nil", client)
+			}
+			if !errors.Is(err, clientgo.ErrInvalidBaseURL) {
+				t.Errorf("errors.Is(err, ErrInvalidBaseURL) = false, err = %v", err)
+			}
+		})
+	}
+}

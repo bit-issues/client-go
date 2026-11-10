@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	clientgo "github.com/bit-issues/client-go"
@@ -22,11 +24,48 @@ func newStubServer(t *testing.T, handler http.HandlerFunc) string {
 	return srv.URL
 }
 
+// mustNew builds a client via clientgo.New and fails the test on error.
+func mustNew(t *testing.T, baseURL string, opts ...clientgo.Option) *clientgo.Client {
+	t.Helper()
+
+	client, err := clientgo.New(baseURL, opts...)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	return client
+}
+
 // newTestClient starts a stub HTTP server for handler and returns a client for it.
 func newTestClient(t *testing.T, handler http.HandlerFunc) *clientgo.Client {
 	t.Helper()
 
-	return clientgo.NewClient(clientgo.Config{BaseURL: newStubServer(t, handler)})
+	return mustNew(t, newStubServer(t, handler))
+}
+
+// eventLog collects ordered events from HTTP handlers, refresh-token handler
+// calls and client lifecycle steps. Every access is mutex-guarded because
+// handlers run on server goroutines while handlers/clients run on the test's
+// own goroutine.
+type eventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+// record appends an event to the log.
+func (l *eventLog) record(event string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.events = append(l.events, event)
+}
+
+// all returns a snapshot of the recorded events.
+func (l *eventLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return slices.Clone(l.events)
 }
 
 // TestErrorEnvelopeClassification locks the parsing of the backend error
@@ -248,10 +287,9 @@ func TestTransportErrorIsTyped(t *testing.T) {
 	baseURL := srv.URL
 	srv.Close()
 
-	client := clientgo.NewClient(clientgo.Config{
-		BaseURL:    baseURL,
-		HTTPClient: &http.Client{Transport: &http.Transport{Proxy: nil}},
-	})
+	client := mustNew(t, baseURL, clientgo.WithHTTPClient(&http.Client{
+		Transport: &http.Transport{Proxy: nil},
+	}))
 
 	_, err := client.GetProject(t.Context(), "any-project")
 
