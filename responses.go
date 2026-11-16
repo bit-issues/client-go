@@ -38,12 +38,25 @@ func parseAPIError(statusCode int, body []byte) error {
 	}
 }
 
+// maxErrorMessageLen caps the verbatim non-JSON body used as an error
+// message: a gateway HTML error page must not become a multi-kilobyte
+// Error() string in logs. The cut is rune-safe so no multi-byte character
+// is split.
+const maxErrorMessageLen = 512
+
 // apiErrorMessage derives a display message when the envelope carries none:
-// a non-JSON body is used verbatim, anything else falls back to the status text.
+// a non-JSON body is used verbatim up to maxErrorMessageLen (an oversized
+// body is truncated with a "..." marker), anything else falls back to the
+// status text.
 func apiErrorMessage(statusCode int, body []byte) string {
 	if !json.Valid(body) {
 		trimmed := strings.TrimSpace(string(body))
 		if trimmed != "" {
+			runes := []rune(trimmed)
+			if len(runes) > maxErrorMessageLen {
+				return string(runes[:maxErrorMessageLen]) + "..."
+			}
+
 			return trimmed
 		}
 	}

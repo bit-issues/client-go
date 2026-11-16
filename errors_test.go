@@ -230,6 +230,18 @@ func TestAPIErrorMessageFallbacks(t *testing.T) {
 			want:   "upstream exploded",
 		},
 		{
+			name:   "oversized non JSON body is truncated",
+			status: http.StatusBadGateway,
+			body:   strings.Repeat("a", 600),
+			want:   strings.Repeat("a", 512) + "...",
+		},
+		{
+			name:   "oversized multi-byte body is truncated on a rune boundary",
+			status: http.StatusServiceUnavailable,
+			body:   strings.Repeat("é", 600),
+			want:   strings.Repeat("é", 512) + "...",
+		},
+		{
 			name:   "empty body falls back to status text",
 			status: http.StatusInternalServerError,
 			body:   "",
