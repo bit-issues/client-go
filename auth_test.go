@@ -531,6 +531,11 @@ func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 
 	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
 
+	// The gate must open before srv.Close waits on the handler, even when the
+	// test bails out early: t.Cleanup runs in LIFO order.
+	releaseLogin := sync.OnceFunc(func() { close(loginRelease) })
+	t.Cleanup(releaseLogin)
+
 	leaderCtx, leaderCancel := context.WithCancel(t.Context())
 	defer leaderCancel()
 
@@ -566,7 +571,7 @@ func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancelled leader still blocked on the gated login")
 	}
-	close(loginRelease)
+	releaseLogin()
 
 	wg.Wait()
 
@@ -630,6 +635,11 @@ func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 
 	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
 
+	// The gate must open before srv.Close waits on the handler, even when the
+	// test bails out early: t.Cleanup runs in LIFO order.
+	releaseRefresh := sync.OnceFunc(func() { close(refreshRelease) })
+	t.Cleanup(releaseRefresh)
+
 	leaderCtx, leaderCancel := context.WithCancel(t.Context())
 	defer leaderCancel()
 
@@ -666,7 +676,7 @@ func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancelled leader still blocked on the gated refresh")
 	}
-	close(refreshRelease)
+	releaseRefresh()
 
 	wg.Wait()
 
