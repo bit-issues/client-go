@@ -1,5 +1,7 @@
 package clientgo
 
+import "time"
+
 // REST endpoint paths, always appended to the configured base URL.
 const (
 	pathPrefix      = "/api/v1"
@@ -17,3 +19,7 @@ const (
 	contentTypeJSON     = "application/json"
 	bearerScheme        = "Bearer "
 )
+
+// authFlightTimeout bounds the detached single-flight login/refresh: the
+// flight ignores caller cancellation, so it carries its own deadline.
+const authFlightTimeout = 30 * time.Second

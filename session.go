@@ -19,6 +19,15 @@ type sessionFlight struct {
 	err  error
 }
 
+// flightContext derives the bounded context a shared login or refresh runs
+// on: values are inherited from the leader's context but its cancellation is
+// detached, so a leader that gives up cannot fail concurrent waiters or abort
+// the flight before rotated tokens are stored. authFlightTimeout bounds the
+// detached call so a hung flight cannot block auth forever.
+func flightContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), authFlightTimeout)
+}
+
 // session owns every credential decision of a Client: the login credentials,
 // BOTH tokens (struct fields, memory only), the mutex/single-flight state
 // and the login/refresh flows. client.go delegates to bearer and
@@ -88,7 +97,10 @@ func (s *session) bearer(ctx context.Context, exec executor) (uint64, string, er
 
 // loginOnce performs at most one login while no access token exists: the
 // first caller becomes the leader and performs it, concurrent callers wait
-// on the same flight and share its result (stdlib [sync.Mutex] only).
+// on the same flight and share its result (stdlib [sync.Mutex] only). The
+// flight runs on a detached, bounded context (see [flightContext]), so the
+// leader's cancellation cannot fail the shared waiters; waiters keep
+// honoring their own contexts through [waitFlight].
 func (s *session) loginOnce(ctx context.Context, exec executor) error {
 	s.mu.Lock()
 
@@ -107,7 +119,10 @@ func (s *session) loginOnce(ctx context.Context, exec executor) error {
 	s.inflight = flight
 	s.mu.Unlock()
 
-	flight.err = s.performLogin(ctx, exec)
+	flightCtx, cancel := flightContext(ctx)
+	defer cancel()
+
+	flight.err = s.performLogin(flightCtx, exec)
 
 	s.mu.Lock()
 	s.inflight = nil
@@ -175,7 +190,10 @@ func (s *session) refreshAfterUnauthorized(
 // caller becomes the leader and performs it, concurrent callers wait on the
 // same flight and share its result. An already-advanced generation means
 // another refresh landed after the caller's request started, so its result
-// is reused without a new call.
+// is reused without a new call. Like the login, the flight runs on a
+// detached, bounded context (see [flightContext]): a cancelled leader can
+// neither fail the waiters nor drop the rotated tokens, which would leave
+// the client holding a revoked refresh token.
 func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) error {
 	s.mu.Lock()
 
@@ -194,7 +212,10 @@ func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) er
 	s.inflight = flight
 	s.mu.Unlock()
 
-	flight.err = s.performRefresh(ctx, exec)
+	flightCtx, cancel := flightContext(ctx)
+	defer cancel()
+
+	flight.err = s.performRefresh(flightCtx, exec)
 
 	s.mu.Lock()
 	s.inflight = nil

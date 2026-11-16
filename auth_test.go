@@ -1,6 +1,7 @@
 package clientgo_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -485,6 +486,181 @@ func TestConcurrentRefreshSingleFlight(t *testing.T) {
 	}
 	if got := unauthorized.Load(); got != concurrentRequests {
 		t.Errorf("401 responses = %d, want %d (every goroutine raced)", got, concurrentRequests)
+	}
+}
+
+// TestLeaderCancellationDoesNotFailSharedFlight cancels the LEADER's context
+// while the shared login is still gated inside the handler: the flight keeps
+// running on its own detached, bounded context, so every waiter still
+// succeeds, exactly ONE login happens and the tokens are stored. Only the
+// leader's own request fails, because its context was cancelled.
+func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
+	t.Parallel()
+
+	const waiters = 7
+
+	var loginHits atomic.Int64
+	loginStarted := make(chan struct{})
+	loginRelease := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			if loginHits.Add(1) == 1 {
+				close(loginStarted)
+			}
+			<-loginRelease
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(bootLoginFixture))
+		case "/api/v1/projects":
+			if got := r.Header.Get("Authorization"); got != "Bearer access-token-value" {
+				t.Errorf("Authorization = %q, want %q", got, "Bearer access-token-value")
+				w.WriteHeader(http.StatusInternalServerError)
+
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"items":[],"total":0}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
+
+	leaderCtx, leaderCancel := context.WithCancel(t.Context())
+	defer leaderCancel()
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, _, err := client.ListProjects(leaderCtx)
+		leaderDone <- err
+	}()
+
+	// The leader is now inside the login handler (no token issued yet): start
+	// the waiters so they join the SAME flight, then cancel only the leader.
+	<-loginStarted
+
+	started := make(chan struct{}, waiters)
+	errs := make([]error, waiters)
+	var wg sync.WaitGroup
+	for i := range waiters {
+		wg.Go(func() {
+			started <- struct{}{}
+			_, _, errs[i] = client.ListProjects(t.Context())
+		})
+	}
+	for range waiters {
+		<-started
+	}
+	leaderCancel()
+	close(loginRelease)
+
+	leaderErr := <-leaderDone
+	wg.Wait()
+
+	if leaderErr == nil {
+		t.Errorf("leader ListProjects() error = nil, want failure from its cancelled context")
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("waiter %d: ListProjects() error = %v", i, err)
+		}
+	}
+	if got := loginHits.Load(); got != 1 {
+		t.Errorf("login calls = %d, want exactly 1 (flight survives leader cancellation)", got)
+	}
+}
+
+// TestRefreshLeaderCancellationDoesNotFailSharedFlight is the refresh twin of
+// TestLeaderCancellationDoesNotFailSharedFlight: cancelling the leader while
+// the rotation is gated must not abort the shared refresh, so waiters retry
+// with the NEW access token, exactly ONE refresh happens and the rotated
+// refresh token is stored — only the leader's own request fails.
+func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
+	t.Parallel()
+
+	const waiters = 7
+
+	var refreshHits atomic.Int64
+	refreshStarted := make(chan struct{})
+	refreshRelease := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(bootLoginFixture))
+		case "/api/v1/auth/refresh":
+			if refreshHits.Add(1) == 1 {
+				close(refreshStarted)
+			}
+			<-refreshRelease
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
+		case "/api/v1/projects/backend-service":
+			switch r.Header.Get("Authorization") {
+			case "Bearer access-token-value":
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
+			case "Bearer ACCESS-B":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"items":[],"total":0}`))
+			default:
+				t.Errorf("Authorization = %q, want access-token-value or ACCESS-B", r.Header.Get("Authorization"))
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
+
+	leaderCtx, leaderCancel := context.WithCancel(t.Context())
+	defer leaderCancel()
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetProject(leaderCtx, "backend-service")
+		leaderDone <- err
+	}()
+
+	// The leader is now inside the refresh handler (the old access token is
+	// still the live one): start the waiters so they 401 and join the SAME
+	// flight, then cancel only the leader.
+	<-refreshStarted
+
+	started := make(chan struct{}, waiters)
+	errs := make([]error, waiters)
+	var wg sync.WaitGroup
+	for i := range waiters {
+		wg.Go(func() {
+			started <- struct{}{}
+			_, errs[i] = client.GetProject(t.Context(), "backend-service")
+		})
+	}
+	for range waiters {
+		<-started
+	}
+	leaderCancel()
+	close(refreshRelease)
+
+	leaderErr := <-leaderDone
+	wg.Wait()
+
+	if leaderErr == nil {
+		t.Errorf("leader GetProject() error = nil, want failure from its cancelled context")
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("waiter %d: GetProject() error = %v", i, err)
+		}
+	}
+	if got := refreshHits.Load(); got != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1 (flight survives leader cancellation)", got)
 	}
 }
 
