@@ -96,11 +96,12 @@ func (s *session) bearer(ctx context.Context, exec executor) (uint64, string, er
 }
 
 // loginOnce performs at most one login while no access token exists: the
-// first caller becomes the leader and performs it, concurrent callers wait
-// on the same flight and share its result (stdlib [sync.Mutex] only). The
-// flight runs on a detached, bounded context (see [flightContext]), so the
-// leader's cancellation cannot fail the shared waiters; waiters keep
-// honoring their own contexts through [waitFlight].
+// first caller becomes the leader and starts the flight, concurrent callers
+// wait on the same flight and share its result (stdlib [sync.Mutex] only).
+// The flight runs on a detached, bounded context (see [flightContext]) so
+// the leader's cancellation cannot fail it, and EVERY caller — leader and
+// waiters alike — waits through [waitFlight]: a cancelled caller returns
+// immediately while the flight still completes and stores the tokens.
 func (s *session) loginOnce(ctx context.Context, exec executor) error {
 	s.mu.Lock()
 
@@ -120,16 +121,18 @@ func (s *session) loginOnce(ctx context.Context, exec executor) error {
 	s.mu.Unlock()
 
 	flightCtx, cancel := flightContext(ctx)
-	defer cancel()
+	go func() {
+		defer cancel()
 
-	flight.err = s.performLogin(flightCtx, exec)
+		flight.err = s.performLogin(flightCtx, exec)
 
-	s.mu.Lock()
-	s.inflight = nil
-	close(flight.done)
-	s.mu.Unlock()
+		s.mu.Lock()
+		s.inflight = nil
+		close(flight.done)
+		s.mu.Unlock()
+	}()
 
-	return flight.err
+	return waitFlight(ctx, flight)
 }
 
 // performLogin POSTs /api/v1/auth/login with the configured credentials
@@ -187,13 +190,14 @@ func (s *session) refreshAfterUnauthorized(
 }
 
 // refreshOnce runs at most one refresh per token generation: the first
-// caller becomes the leader and performs it, concurrent callers wait on the
-// same flight and share its result. An already-advanced generation means
-// another refresh landed after the caller's request started, so its result
-// is reused without a new call. Like the login, the flight runs on a
-// detached, bounded context (see [flightContext]): a cancelled leader can
-// neither fail the waiters nor drop the rotated tokens, which would leave
-// the client holding a revoked refresh token.
+// caller becomes the leader and starts the flight, concurrent callers wait
+// on the same flight and share its result. An already-advanced generation
+// means another refresh landed after the caller's request started, so its
+// result is reused without a new call. Like the login, the flight runs on a
+// detached, bounded context (see [flightContext]) and every caller waits
+// through [waitFlight]: a cancelled leader returns immediately without
+// failing the waiters, and the rotation still completes and stores its
+// tokens — the client is never left holding a revoked refresh token.
 func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) error {
 	s.mu.Lock()
 
@@ -213,16 +217,18 @@ func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) er
 	s.mu.Unlock()
 
 	flightCtx, cancel := flightContext(ctx)
-	defer cancel()
+	go func() {
+		defer cancel()
 
-	flight.err = s.performRefresh(flightCtx, exec)
+		flight.err = s.performRefresh(flightCtx, exec)
 
-	s.mu.Lock()
-	s.inflight = nil
-	close(flight.done)
-	s.mu.Unlock()
+		s.mu.Lock()
+		s.inflight = nil
+		close(flight.done)
+		s.mu.Unlock()
+	}()
 
-	return flight.err
+	return waitFlight(ctx, flight)
 }
 
 // performRefresh exchanges the in-memory refresh token for a new pair via

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	clientgo "github.com/bit-issues/client-go"
 )
@@ -490,10 +491,11 @@ func TestConcurrentRefreshSingleFlight(t *testing.T) {
 }
 
 // TestLeaderCancellationDoesNotFailSharedFlight cancels the LEADER's context
-// while the shared login is still gated inside the handler: the flight keeps
-// running on its own detached, bounded context, so every waiter still
-// succeeds, exactly ONE login happens and the tokens are stored. Only the
-// leader's own request fails, because its context was cancelled.
+// while the shared login is still gated inside the handler: the leader must
+// return immediately, while the flight keeps running on its own detached,
+// bounded context — so every waiter still succeeds, exactly ONE login
+// happens and the tokens are stored. Only the leader's own request fails,
+// because its context was cancelled.
 func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 	t.Parallel()
 
@@ -555,9 +557,17 @@ func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 		<-started
 	}
 	leaderCancel()
+
+	// The cancelled leader must return WHILE the login gate is still closed;
+	// only then is the early-return guarantee exercised.
+	var leaderErr error
+	select {
+	case leaderErr = <-leaderDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled leader still blocked on the gated login")
+	}
 	close(loginRelease)
 
-	leaderErr := <-leaderDone
 	wg.Wait()
 
 	if leaderErr == nil {
@@ -575,9 +585,10 @@ func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 
 // TestRefreshLeaderCancellationDoesNotFailSharedFlight is the refresh twin of
 // TestLeaderCancellationDoesNotFailSharedFlight: cancelling the leader while
-// the rotation is gated must not abort the shared refresh, so waiters retry
-// with the NEW access token, exactly ONE refresh happens and the rotated
-// refresh token is stored — only the leader's own request fails.
+// the rotation is gated must return the leader immediately WITHOUT aborting
+// the shared refresh, so waiters retry with the NEW access token, exactly ONE
+// refresh happens and the rotated refresh token is stored — only the leader's
+// own request fails.
 func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 	t.Parallel()
 
@@ -646,9 +657,17 @@ func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 		<-started
 	}
 	leaderCancel()
+
+	// The cancelled leader must return WHILE the refresh gate is still
+	// closed; only then is the early-return guarantee exercised.
+	var leaderErr error
+	select {
+	case leaderErr = <-leaderDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled leader still blocked on the gated refresh")
+	}
 	close(refreshRelease)
 
-	leaderErr := <-leaderDone
 	wg.Wait()
 
 	if leaderErr == nil {
