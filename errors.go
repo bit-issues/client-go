@@ -35,10 +35,16 @@ var ErrTransport = errors.New("transport error")
 // URL; New rejects it instead of panicking later.
 var ErrInvalidBaseURL = errors.New("base URL must not be empty")
 
-// ErrInvalidCredentials classifies a WithLogin option carrying an empty or
-// whitespace email or password; New rejects it instead of failing at the
-// first request.
+// ErrInvalidCredentials classifies a Login call with an empty or whitespace
+// email or password; Login rejects it before any request is sent.
 var ErrInvalidCredentials = errors.New("login email and password must not be empty")
+
+// ErrSessionExpired classifies a refresh whose refresh token the backend
+// rejected (401: revoked or expired): the session is over and the caller
+// must log in again. The message deliberately carries no token value, and a
+// transient failure (5xx, transport) never maps to it - those keep their
+// existing sentinels.
+var ErrSessionExpired = errors.New("session expired - log in again")
 
 // APIError is the typed error returned for every non-2xx API response, parsed
 // from the backend error envelope {message, code?} (details are ignored in v1).

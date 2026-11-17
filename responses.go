@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+// maxErrorMessageLen caps the verbatim non-JSON body used as an error
+// message: a gateway HTML error page must not become a multi-kilobyte
+// Error() string in logs. The cut is rune-safe so no multi-byte character
+// is split.
+const maxErrorMessageLen = 512
+
 // errorEnvelope is the backend error body {message, code?}. Details are
 // ignored in v1 and the envelope deliberately has no "errors" field.
 type errorEnvelope struct {
@@ -37,12 +43,6 @@ func parseAPIError(statusCode int, body []byte) error {
 		sentinel:   apiErrorSentinel(statusCode),
 	}
 }
-
-// maxErrorMessageLen caps the verbatim non-JSON body used as an error
-// message: a gateway HTML error page must not become a multi-kilobyte
-// Error() string in logs. The cut is rune-safe so no multi-byte character
-// is split.
-const maxErrorMessageLen = 512
 
 // apiErrorMessage derives a display message when the envelope carries none:
 // a non-JSON body is used verbatim up to maxErrorMessageLen (an oversized

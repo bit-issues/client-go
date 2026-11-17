@@ -1,5 +1,7 @@
 package clientgo
 
+// Enumerations: task domain values shared across the wire and the client.
+
 // Priority represents task priority levels, matching BitBucket values.
 type Priority string
 
@@ -69,4 +71,29 @@ func (s Status) IsValid() bool {
 	default:
 		return false
 	}
+}
+
+// Credential value types exchanged by the auth surface.
+
+// Auth is the per-call credential of the STATELESS read surface: an empty
+// Auth sends no bearer header. It exists for callers that already hold an
+// access token; code that must never touch tokens should hold a [Session]
+// instead and call its reads without credentials.
+type Auth struct {
+	// AccessToken is sent as the bearer credential when non-empty.
+	AccessToken string
+}
+
+// Tokens is the credential pair exchanged by Login and Refresh and stored by
+// a Session. Token values never appear in error messages or logs.
+type Tokens struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+// LoginResult is what a successful Login returns: the exchanged token pair
+// (to persist outside client-go as the caller sees fit) and the profile.
+type LoginResult struct {
+	Tokens Tokens
+	User   UserResponseDTO
 }

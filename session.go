@@ -4,41 +4,18 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 )
 
-// executor performs one HTTP exchange; the client's roundTrip implements it,
-// so request construction and execution stay in client.go.
-type executor func(ctx context.Context, method, urlStr string, payload any, accessToken string) (int, []byte, error)
-
-// sessionFlight is the shared result of one single-flight login or refresh;
-// its fields are written by the leader before done is closed, so waiters
-// read them safely after receiving from done.
-type sessionFlight struct {
-	done chan struct{}
-	err  error
-}
-
-// flightContext derives the bounded context a shared login or refresh runs
-// on: values are inherited from the leader's context but its cancellation is
-// detached, so a leader that gives up cannot fail concurrent waiters or abort
-// the flight before rotated tokens are stored. authFlightTimeout bounds the
-// detached call so a hung flight cannot block auth forever.
-func flightContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), authFlightTimeout)
-}
-
-// session owns every credential decision of a Client: the login credentials,
-// BOTH tokens (struct fields, memory only), the mutex/single-flight state
-// and the login/refresh flows. client.go delegates to bearer and
-// refreshAfterUnauthorized and contains no auth parsing at all; nothing
-// about credentials ever touches the filesystem inside client-go.
-type session struct {
-	baseURL     string
-	staticToken string
-	email       string
-	password    string
-
+// Session is the STATEFUL wrapper around a [Client]: it keeps BOTH tokens
+// in memory (mutex-guarded), injects the access token into every read and
+// refreshes ONCE on a 401 before retrying the original request exactly once.
+// It performs no credential exchange of its own - the caller seeds tokens
+// through [NewSession] and persists rotated ones via [Session.Tokens]; storage
+// always lives outside client-go.
+type Session struct {
+	client       *Client
 	mu           sync.Mutex
 	accessToken  string
 	refreshToken string
@@ -46,143 +23,149 @@ type session struct {
 	inflight     *sessionFlight
 }
 
-// newSession builds the credential state for a client from its config; all
-// mutable fields start zeroed and the mutex is its zero value.
-func newSession(baseURL string, cfg clientConfig) session {
-	return session{
-		baseURL:      baseURL,
-		staticToken:  cfg.accessToken,
-		email:        cfg.email,
-		password:     cfg.password,
+// NewSession returns a Session for baseURL (validated exactly like New) that
+// starts from tokens - either pair may be empty: no access token means the
+// first read runs without a bearer, and no refresh token makes the session
+// static-style (401 is surfaced as ErrUnauthorized, refresh never attempted).
+// A refresh token the backend rejects mid-flight becomes ErrSessionExpired.
+func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error) {
+	client, err := New(baseURL, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Session{
+		client:       client,
 		mu:           sync.Mutex{},
-		accessToken:  "",
-		refreshToken: "",
+		accessToken:  tokens.AccessToken,
+		refreshToken: tokens.RefreshToken,
 		generation:   0,
 		inflight:     nil,
-	}
+	}, nil
 }
 
-// bearer returns the generation of the access token and the bearer
-// credential to send, performing the internal login first when WithLogin is
-// configured and no access token exists yet. Concurrent first uses share
-// exactly ONE login through the single-flight slot; a static token always
-// wins and never logs in.
-func (s *session) bearer(ctx context.Context, exec executor) (uint64, string, error) {
-	if s.staticToken != "" {
-		return 0, s.staticToken, nil
-	}
+// Do sends a request like [Client.Do] but injects the Session's current
+// access token. On a 401 the Session refreshes at most once (single-flight)
+// and retries the original request exactly once; a second 401 is returned as
+// ErrUnauthorized, and a rejected refresh token surfaces as ErrSessionExpired
+// without any retry.
+func (s *Session) Do(
+	ctx context.Context,
+	method, path string,
+	query url.Values,
+	payload, response any,
+) error {
+	return s.do(ctx, method, path, query, payload, response, false)
+}
 
-	s.mu.Lock()
-	gen, token := s.generation, s.accessToken
-	s.mu.Unlock()
-
-	if token != "" {
-		return gen, token, nil
-	}
-	// New guarantees both fields are non-empty when WithLogin was used, so
-	// an empty email means no login mode at all.
-	if s.email == "" {
-		return gen, "", nil
-	}
-
-	if err := s.loginOnce(ctx, exec); err != nil {
-		return 0, "", err
-	}
-
+// Tokens returns a mutex-protected snapshot of the CURRENT in-memory token
+// pair (post-rotation) - the caller's bridge for saving state on exit.
+func (s *Session) Tokens() Tokens {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.generation, s.accessToken, nil
+	return Tokens{AccessToken: s.accessToken, RefreshToken: s.refreshToken}
 }
 
-// loginOnce performs at most one login while no access token exists: the
-// first caller becomes the leader and starts the flight, concurrent callers
-// wait on the same flight and share its result (stdlib [sync.Mutex] only).
-// The flight runs on a detached, bounded context (see [flightContext]) so
-// the leader's cancellation cannot fail it, and EVERY caller — leader and
-// waiters alike — waits through [waitFlight]: a cancelled caller returns
-// immediately while the flight still completes and stores the tokens.
-func (s *session) loginOnce(ctx context.Context, exec executor) error {
-	s.mu.Lock()
-
-	if s.accessToken != "" {
-		s.mu.Unlock()
-		return nil
-	}
-	if s.inflight != nil {
-		flight := s.inflight
-		s.mu.Unlock()
-
-		return waitFlight(ctx, flight)
-	}
-
-	flight := &sessionFlight{done: make(chan struct{}), err: nil}
-	s.inflight = flight
-	s.mu.Unlock()
-
-	flightCtx, cancel := flightContext(ctx)
-	go func() {
-		defer cancel()
-
-		flight.err = s.performLogin(flightCtx, exec)
-
-		s.mu.Lock()
-		s.inflight = nil
-		close(flight.done)
-		s.mu.Unlock()
-	}()
-
-	return waitFlight(ctx, flight)
-}
-
-// performLogin POSTs /api/v1/auth/login with the configured credentials
-// (byte-exact JSON body) and keeps BOTH tokens in memory. The failure
-// taxonomy is the shared API error parsing: 401 -> ErrUnauthorized,
-// 403 -> ErrForbidden, 5xx -> server errors, transport -> ErrTransport; no
-// password and no token value can enter the returned error.
-func (s *session) performLogin(ctx context.Context, exec executor) error {
-	status, body, err := exec(
-		ctx,
-		http.MethodPost,
-		requestURL(s.baseURL, pathAuthLogin, nil),
-		LoginRequest{Email: s.email, Password: s.password},
-		"",
-	)
-	if err != nil {
+// Logout revokes the in-memory refresh token via the stateless client (the
+// API answers 204 with an EMPTY body, which is never decoded) and then
+// clears BOTH tokens in memory. With no refresh token in memory the HTTP
+// call is skipped (stateless no-op) and the memory clear still runs. A
+// failed revoke keeps the tokens so the caller may retry.
+func (s *Session) Logout(ctx context.Context) error {
+	if err := s.client.Logout(ctx, s.currentRefreshToken()); err != nil {
 		return err
 	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return parseAPIError(status, body)
-	}
 
-	var resp LoginResponse
-	if decodeErr := decodeJSONBody(body, &resp); decodeErr != nil {
-		return decodeErr
-	}
-	if resp.AccessToken == "" || resp.RefreshToken == "" {
-		return fmt.Errorf("%w: login response is missing a token", ErrUnauthorized)
-	}
-
-	s.setTokens(resp.AccessToken, resp.RefreshToken)
+	s.setTokens("", "")
 
 	return nil
 }
 
-// refreshAfterUnauthorized refreshes after a 401 (single-flight) and reports
-// whether the caller may retry its original request exactly once. Static-token
-// mode and a client without a login-issued refresh token both decline, so the
-// caller surfaces its original 401 as ErrUnauthorized instead; a failed
-// refresh propagates its typed error and blocks the retry.
-func (s *session) refreshAfterUnauthorized(
+// ListProjects returns all projects and the total count reported by the API.
+func (s *Session) ListProjects(ctx context.Context) ([]Project, int, error) {
+	return listProjects(ctx, s.Do)
+}
+
+// GetProject returns the project identified by its slug (the project ID on the wire).
+func (s *Session) GetProject(ctx context.Context, slug string) (*Project, error) {
+	return getProject(ctx, s.Do, slug)
+}
+
+// ListTasks returns a page of tasks matching params.
+func (s *Session) ListTasks(ctx context.Context, params ListTasksParams) (*TaskListResponse, error) {
+	return listTasks(ctx, s.Do, params)
+}
+
+// GetTaskByID returns the base task fields of the task with the given ID.
+// The endpoint returns the full details payload; the project, comments and
+// attachments keys are ignored here - use GetTaskDetails to read them.
+func (s *Session) GetTaskByID(ctx context.Context, id int64) (*TaskResponse, error) {
+	return getTaskByID(ctx, s.Do, id)
+}
+
+// GetTaskByNumber returns the base task fields of the task identified by its
+// project slug and its number within that project.
+func (s *Session) GetTaskByNumber(ctx context.Context, slug string, number int) (*TaskResponse, error) {
+	return getTaskByNumber(ctx, s.Do, slug, number)
+}
+
+// GetTaskDetails returns the full details payload of the task with the given
+// ID, including the project, comments and attachments.
+func (s *Session) GetTaskDetails(ctx context.Context, id int64) (*TaskDetailsResponse, error) {
+	return getTaskDetails(ctx, s.Do, id)
+}
+
+// do is the retry-aware request core of the Session; retried marks the
+// single allowed follow-up after a refresh so a second 401 can never loop.
+func (s *Session) do(
 	ctx context.Context,
-	gen uint64,
-	exec executor,
-) (bool, error) {
-	if s.staticToken != "" || s.currentRefreshToken() == "" {
+	method, path string,
+	query url.Values,
+	payload, response any,
+	retried bool,
+) error {
+	gen, token := s.credentialState()
+
+	status, body, err := s.client.roundTrip(ctx, method, requestURL(s.client.baseURL, path, query), payload, token)
+	if err != nil {
+		return err
+	}
+
+	if status == http.StatusUnauthorized && !retried && !isAuthPath(path) {
+		canRetry, refreshErr := s.refreshAfterUnauthorized(ctx, gen)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if canRetry {
+			return s.do(ctx, method, path, query, payload, response, true)
+		}
+	}
+
+	return finishResponse(status, body, response)
+}
+
+// credentialState returns the generation of the in-memory access token and
+// the bearer to send.
+func (s *Session) credentialState() (uint64, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.generation, s.accessToken
+}
+
+// refreshAfterUnauthorized refreshes after a 401 (single-flight) and reports
+// whether the caller may retry its original request exactly once. Without an
+// in-memory refresh token (static-style session) it declines, so the caller
+// surfaces its original 401 as ErrUnauthorized instead; a failed refresh -
+// ErrSessionExpired, a 5xx or a transport failure - propagates its typed
+// error and blocks the retry.
+func (s *Session) refreshAfterUnauthorized(ctx context.Context, gen uint64) (bool, error) {
+	if s.currentRefreshToken() == "" {
 		return false, nil
 	}
 
-	if err := s.refreshOnce(ctx, gen, exec); err != nil {
+	if err := s.refreshOnce(ctx, gen); err != nil {
 		return false, err
 	}
 
@@ -191,14 +174,14 @@ func (s *session) refreshAfterUnauthorized(
 
 // refreshOnce runs at most one refresh per token generation: the first
 // caller becomes the leader and starts the flight, concurrent callers wait
-// on the same flight and share its result. An already-advanced generation
-// means another refresh landed after the caller's request started, so its
-// result is reused without a new call. Like the login, the flight runs on a
-// detached, bounded context (see [flightContext]) and every caller waits
-// through [waitFlight]: a cancelled leader returns immediately without
-// failing the waiters, and the rotation still completes and stores its
-// tokens — the client is never left holding a revoked refresh token.
-func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) error {
+// on the same flight and share its result (stdlib [sync.Mutex] only). An
+// already-advanced generation means another rotation landed after the
+// caller's request started, so its result is reused without a new call. The
+// flight runs on a detached, bounded context (see [flightContext]) and every
+// caller waits through [waitFlight]: a cancelled leader returns immediately
+// without failing the waiters, and the rotation still completes and stores
+// its tokens - the Session is never left holding a revoked refresh token.
+func (s *Session) refreshOnce(ctx context.Context, gen uint64) error {
 	s.mu.Lock()
 
 	if s.generation != gen {
@@ -220,7 +203,7 @@ func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) er
 	go func() {
 		defer cancel()
 
-		flight.err = s.performRefresh(flightCtx, exec)
+		flight.err = s.performRefresh(flightCtx)
 
 		s.mu.Lock()
 		s.inflight = nil
@@ -231,42 +214,26 @@ func (s *session) refreshOnce(ctx context.Context, gen uint64, exec executor) er
 	return waitFlight(ctx, flight)
 }
 
-// performRefresh exchanges the in-memory refresh token for a new pair via
-// POST /api/v1/auth/refresh and swaps BOTH tokens in memory before the
-// caller retries (the in-memory swap is trivially ordered before the retry).
-// The backend ROTATES - it revokes the OLD refresh token BEFORE responding -
-// and the failure taxonomy matches performLogin through parseAPIError.
-func (s *session) performRefresh(ctx context.Context, exec executor) error {
-	status, body, err := exec(
-		ctx,
-		http.MethodPost,
-		requestURL(s.baseURL, pathAuthRefresh, nil),
-		RefreshRequest{RefreshToken: s.currentRefreshToken()},
-		"",
-	)
+// performRefresh exchanges the in-memory refresh token through the stateless
+// [Client.Refresh] - the refresh HTTP call itself lives in client.go - and
+// swaps BOTH tokens in memory before the caller retries (the in-memory swap
+// is trivially ordered before the retry). The backend ROTATES: it revokes the
+// OLD refresh token BEFORE responding. ErrSessionExpired from a rejected
+// token and every transient failure pass through unmodified.
+func (s *Session) performRefresh(ctx context.Context) error {
+	tokens, err := s.client.Refresh(ctx, s.currentRefreshToken())
 	if err != nil {
 		return err
 	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return parseAPIError(status, body)
-	}
 
-	var pair RefreshResponse
-	if decodeErr := decodeJSONBody(body, &pair); decodeErr != nil {
-		return decodeErr
-	}
-	if pair.AccessToken == "" || pair.RefreshToken == "" {
-		return fmt.Errorf("%w: refresh response is missing a token", ErrUnauthorized)
-	}
-
-	s.setTokens(pair.AccessToken, pair.RefreshToken)
+	s.setTokens(tokens.AccessToken, tokens.RefreshToken)
 
 	return nil
 }
 
 // setTokens replaces BOTH in-memory tokens and bumps the generation so
 // requests already in flight can detect the change.
-func (s *session) setTokens(accessToken, refreshToken string) {
+func (s *Session) setTokens(accessToken, refreshToken string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -276,15 +243,32 @@ func (s *session) setTokens(accessToken, refreshToken string) {
 }
 
 // currentRefreshToken returns the in-memory refresh token.
-func (s *session) currentRefreshToken() string {
+func (s *Session) currentRefreshToken() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	return s.refreshToken
 }
 
-// waitFlight waits for an in-flight login or refresh and shares its result;
-// the waiting is cancelled by the caller's context.
+// sessionFlight is the shared result of one single-flight refresh; its
+// fields are written by the leader before done is closed, so waiters read
+// them safely after receiving from done.
+type sessionFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// flightContext derives the bounded context a shared refresh runs on: values
+// are inherited from the leader's context but its cancellation is detached,
+// so a leader that gives up cannot fail concurrent waiters or abort the
+// flight before rotated tokens are stored. authFlightTimeout bounds the
+// detached call so a hung flight cannot block auth forever.
+func flightContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), authFlightTimeout)
+}
+
+// waitFlight waits for an in-flight refresh and shares its result; the
+// waiting is cancelled by the caller's own context.
 func waitFlight(ctx context.Context, flight *sessionFlight) error {
 	select {
 	case <-flight.done:

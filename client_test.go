@@ -44,9 +44,9 @@ func TestListProjects(t *testing.T) {
 			`],"total":7}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler)+"/", clientgo.WithAccessToken("test-token"))
+	client := mustNew(t, newStubServer(t, handler)+"/")
 
-	items, total, err := client.ListProjects(t.Context())
+	items, total, err := client.ListProjects(t.Context(), clientgo.Auth{AccessToken: "test-token"})
 
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -93,7 +93,7 @@ func TestGetProject(t *testing.T) {
 			`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-02T09:00:00Z"}`))
 	})
 
-	project, err := client.GetProject(t.Context(), "backend-service")
+	project, err := client.GetProject(t.Context(), clientgo.Auth{}, "backend-service")
 
 	if err != nil {
 		t.Fatalf("GetProject() error = %v", err)
@@ -158,7 +158,7 @@ func TestListTasksSendsAllQueryParams(t *testing.T) {
 			`}],"total":1}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithAccessToken("test-token"))
+	client := mustNew(t, newStubServer(t, handler))
 
 	params := clientgo.ListTasksParams{
 		Limit:      testListLimit,
@@ -172,7 +172,7 @@ func TestListTasksSendsAllQueryParams(t *testing.T) {
 		Search:     "nil pointer dereference",
 	}
 
-	list, err := client.ListTasks(t.Context(), params)
+	list, err := client.ListTasks(t.Context(), clientgo.Auth{AccessToken: "test-token"}, params)
 
 	if err != nil {
 		t.Fatalf("ListTasks() error = %v", err)
@@ -227,7 +227,7 @@ func TestListTasksOmitsEmptyParams(t *testing.T) {
 
 	client := newTestClient(t, handler)
 
-	list, err := client.ListTasks(t.Context(), clientgo.ListTasksParams{})
+	list, err := client.ListTasks(t.Context(), clientgo.Auth{}, clientgo.ListTasksParams{})
 
 	if err != nil {
 		t.Fatalf("ListTasks() error = %v", err)
@@ -258,7 +258,7 @@ func TestGetTaskByIDDecodesBaseFields(t *testing.T) {
 		_, _ = w.Write([]byte(taskDetailsFixture))
 	})
 
-	task, err := client.GetTaskByID(t.Context(), 42)
+	task, err := client.GetTaskByID(t.Context(), clientgo.Auth{}, 42)
 
 	if err != nil {
 		t.Fatalf("GetTaskByID() error = %v", err)
@@ -302,7 +302,7 @@ func TestGetTaskByNumber(t *testing.T) {
 		_, _ = w.Write([]byte(taskDetailsFixture))
 	})
 
-	task, err := client.GetTaskByNumber(t.Context(), "backend-service", 7)
+	task, err := client.GetTaskByNumber(t.Context(), clientgo.Auth{}, "backend-service", 7)
 
 	if err != nil {
 		t.Fatalf("GetTaskByNumber() error = %v", err)
@@ -332,7 +332,7 @@ func TestGetTaskDetails(t *testing.T) {
 		_, _ = w.Write([]byte(taskDetailsFixture))
 	})
 
-	details, err := client.GetTaskDetails(t.Context(), 42)
+	details, err := client.GetTaskDetails(t.Context(), clientgo.Auth{}, 42)
 
 	if err != nil {
 		t.Fatalf("GetTaskDetails() error = %v", err)
@@ -367,7 +367,7 @@ func TestBaseURLWithPathPrefix(t *testing.T) {
 
 	client := mustNew(t, newStubServer(t, handler)+"/bit/")
 
-	_, _, err := client.ListProjects(t.Context())
+	_, _, err := client.ListProjects(t.Context(), clientgo.Auth{})
 
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -385,7 +385,7 @@ func TestEmptyBodyIsSuccess(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	items, total, err := client.ListProjects(t.Context())
+	items, total, err := client.ListProjects(t.Context(), clientgo.Auth{})
 
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -404,7 +404,7 @@ func TestGetProjectNotFound(t *testing.T) {
 		_, _ = w.Write([]byte(`{"message":"project not found"}`))
 	})
 
-	_, err := client.GetProject(t.Context(), "missing")
+	_, err := client.GetProject(t.Context(), clientgo.Auth{}, "missing")
 
 	if err == nil {
 		t.Fatal("GetProject() error = nil, want error")

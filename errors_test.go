@@ -166,7 +166,7 @@ func TestErrorEnvelopeClassification(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			})
 
-			_, err := client.GetProject(t.Context(), "any-project")
+			_, err := client.GetProject(t.Context(), clientgo.Auth{}, "any-project")
 
 			if err == nil {
 				t.Fatal("GetProject() error = nil, want error")
@@ -276,7 +276,7 @@ func TestAPIErrorMessageFallbacks(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			})
 
-			_, err := client.GetProject(t.Context(), "any-project")
+			_, err := client.GetProject(t.Context(), clientgo.Auth{}, "any-project")
 
 			var apiErr *clientgo.APIError
 			if !errors.As(err, &apiErr) {
@@ -303,7 +303,7 @@ func TestTransportErrorIsTyped(t *testing.T) {
 		Transport: &http.Transport{Proxy: nil},
 	}))
 
-	_, err := client.GetProject(t.Context(), "any-project")
+	_, err := client.GetProject(t.Context(), clientgo.Auth{}, "any-project")
 
 	if err == nil {
 		t.Fatal("GetProject() error = nil, want transport error")

@@ -1,104 +1,134 @@
 package clientgo_test
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
-	"slices"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	clientgo "github.com/bit-issues/client-go"
 )
 
-// alphaLoginFixture is the wire payload of a successful internal login:
-// ACCESS-1 becomes the first bearer, REFRESH-0 feeds the refresh flow.
-const alphaLoginFixture = `{"access_token":"ACCESS-1","refresh_token":"REFRESH-0",` +
+// loginOKFixture is the wire payload of a successful POST /api/v1/auth/login.
+const loginOKFixture = `{"access_token":"ACCESS-1","refresh_token":"REFRESH-0",` +
 	`"user":{"id":1,"email":"u@x.example","name":"alice",` +
 	`"role":"admin","status":"active",` +
 	`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-01T09:00:00Z"}}`
 
-// bootLoginFixture is the login payload used by the concurrency tests.
-const bootLoginFixture = `{"access_token":"access-token-value","refresh_token":"refresh-token-value",` +
-	`"user":{"id":1,"email":"u@x.example","name":"alice",` +
-	`"role":"admin","status":"active",` +
-	`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-01T09:00:00Z"}}`
-
-// TestLoginAtFirstUse checks the login-per-boot model: with WithLogin set and
-// no prior login, the FIRST auth-needing request performs the internal login
-// (byte-exact JSON body), keeps the tokens in memory and proceeds with the
-// login's access token as bearer. Exactly one login call, exact event order.
-func TestLoginAtFirstUse(t *testing.T) {
+// TestLoginReturnsTokensAndUser checks the stateless Login round trip:
+// byte-exact JSON body, no Authorization header, and a LoginResult carrying
+// BOTH tokens plus every profile field - no token in any returned error.
+func TestLoginReturnsTokensAndUser(t *testing.T) {
 	t.Parallel()
 
-	events := &eventLog{}
-
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			events.record("login")
-			if r.Method != http.MethodPost {
-				t.Errorf("method = %q, want %q", r.Method, http.MethodPost)
-			}
-			if got := r.Header.Get("Content-Type"); got != "application/json" {
-				t.Errorf("Content-Type = %q, want %q", got, "application/json")
-			}
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read body: %v", err)
-				return
-			}
-			const wantLoginBody = `{"email":"u@x.example","password":"pw-secret"}`
-			if string(body) != wantLoginBody {
-				t.Errorf("login body = %q, want %q", string(body), wantLoginBody)
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(alphaLoginFixture))
-		case "/api/v1/projects/backend-service":
-			if got := r.Header.Get("Authorization"); got != "Bearer ACCESS-1" {
-				t.Errorf("Authorization = %q, want %q", got, "Bearer ACCESS-1")
-			}
-			events.record("read-200")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"backend-service","name":"Backend Service",` +
-				`"repo_url":"https://bitbucket.org/company/backend",` +
-				`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-02T09:00:00Z"}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want %q", r.Method, http.MethodPost)
 		}
+		if r.URL.Path != "/api/v1/auth/login" {
+			t.Errorf("path = %q, want %q", r.URL.Path, "/api/v1/auth/login")
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want %q", got, "application/json")
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		const wantBody = `{"email":"u@x.example","password":"pw-secret"}`
+		if string(body) != wantBody {
+			t.Errorf("body = %q, want %q", string(body), wantBody)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(loginOKFixture))
 	}
 
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
+	client := mustNew(t, newStubServer(t, handler))
 
-	project, err := client.GetProject(t.Context(), "backend-service")
+	result, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
 	if err != nil {
-		t.Fatalf("GetProject() error = %v", err)
+		t.Fatalf("Login() error = %v", err)
 	}
-	if project == nil || project.ID != "backend-service" {
-		t.Errorf("project = %+v, want ID backend-service", project)
+	if result.Tokens.AccessToken != "ACCESS-1" {
+		t.Errorf("Tokens.AccessToken = %q, want %q", result.Tokens.AccessToken, "ACCESS-1")
 	}
-
-	got := events.all()
-	if want := []string{"login", "read-200"}; !slices.Equal(got, want) {
-		t.Errorf("events = %v, want %v", got, want)
+	if result.Tokens.RefreshToken != "REFRESH-0" {
+		t.Errorf("Tokens.RefreshToken = %q, want %q", result.Tokens.RefreshToken, "REFRESH-0")
 	}
-	if logins := countEvents(got, "login"); logins != 1 {
-		t.Errorf("login calls = %d, want exactly 1", logins)
+	if result.User.ID != 1 {
+		t.Errorf("User.ID = %d, want 1", result.User.ID)
+	}
+	if result.User.Email != "u@x.example" {
+		t.Errorf("User.Email = %q, want %q", result.User.Email, "u@x.example")
+	}
+	if result.User.Name != "alice" {
+		t.Errorf("User.Name = %q, want %q", result.User.Name, "alice")
+	}
+	if result.User.Role != "admin" {
+		t.Errorf("User.Role = %q, want %q", result.User.Role, "admin")
+	}
+	if result.User.Status != "active" {
+		t.Errorf("User.Status = %q, want %q", result.User.Status, "active")
+	}
+	if want := "2026-04-01T08:00:00Z"; result.User.CreatedAt.Format("2006-01-02T15:04:05Z07:00") != want {
+		t.Errorf("User.CreatedAt = %v, want %s", result.User.CreatedAt, want)
 	}
 }
 
-// TestLoginFailure checks the login failure taxonomy through the shared API
-// error parsing: 401 -> ErrUnauthorized, 403 (non-active) -> ErrForbidden,
-// 5xx -> server error. The read endpoints must never be reached.
-func TestLoginFailure(t *testing.T) {
+// TestLoginRejectsEmptyCredentials checks Login rejects empty or whitespace
+// email/password with the typed ErrInvalidCredentials BEFORE any request.
+func TestLoginRejectsEmptyCredentials(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		email    string
+		password string
+	}{
+		{name: "empty email", email: "", password: "pw-secret"},
+		{name: "whitespace email", email: "  ", password: "pw-secret"},
+		{name: "empty password", email: "u@x.example", password: ""},
+		{name: "whitespace password", email: "u@x.example", password: "\t"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hit atomic.Bool
+			handler := func(w http.ResponseWriter, _ *http.Request) {
+				hit.Store(true)
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			client := mustNew(t, newStubServer(t, handler))
+
+			result, err := client.Login(t.Context(), tc.email, tc.password)
+
+			if !errors.Is(err, clientgo.ErrInvalidCredentials) {
+				t.Errorf("errors.Is(err, ErrInvalidCredentials) = false, err = %v", err)
+			}
+			if result.Tokens != (clientgo.Tokens{}) {
+				t.Errorf("result.Tokens = %+v, want zero", result.Tokens)
+			}
+			if hit.Load() {
+				t.Error("request was sent, want rejection before any HTTP call")
+			}
+		})
+	}
+}
+
+// TestLoginFailureTaxonomy checks the shared API error parsing for Login:
+// 401 -> ErrUnauthorized, 403 (non-active account) -> ErrForbidden,
+// 5xx -> server error.
+func TestLoginFailureTaxonomy(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -145,10 +175,9 @@ func TestLoginFailure(t *testing.T) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
 			}
+			client := mustNew(t, newStubServer(t, handler))
 
-			client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-			_, err := client.GetProject(t.Context(), "backend-service")
+			_, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
 			if !errors.Is(err, tc.wantSent) {
 				t.Fatalf("errors.Is(err, %v) = false, err = %v", tc.wantSent, err)
@@ -160,704 +189,148 @@ func TestLoginFailure(t *testing.T) {
 	}
 }
 
-// TestRefreshOnceAfterFirstUse checks the 401 path after a first-use login:
-// the second request 401s, the client refreshes exactly ONCE with the
-// in-memory refresh token, swaps both tokens in memory and retries with the
-// NEW access token; the first-use login happened before all of it.
-func TestRefreshOnceAfterFirstUse(t *testing.T) {
-	t.Parallel()
-
-	const (
-		wantLoginCalls   = 1
-		wantRefreshCalls = 1
-	)
-
-	events := &eventLog{}
-	var firstBearerReads atomic.Int64
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			events.record("login")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(alphaLoginFixture))
-		case "/api/v1/auth/refresh":
-			events.record("refresh")
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read body: %v", err)
-				return
-			}
-			const wantRefreshBody = `{"refresh_token":"REFRESH-0"}`
-			if string(body) != wantRefreshBody {
-				t.Errorf("refresh body = %q, want %q", string(body), wantRefreshBody)
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"ACCESS-2","refresh_token":"ROTATED"}`))
-		case "/api/v1/projects/backend-service":
-			switch r.Header.Get("Authorization") {
-			case "Bearer ACCESS-1":
-				if firstBearerReads.Add(1) == 1 {
-					events.record("read-200")
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"id":"backend-service","name":"Backend Service",` +
-						`"repo_url":"https://bitbucket.org/company/backend",` +
-						`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-02T09:00:00Z"}`))
-
-					return
-				}
-				events.record("read-401")
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-			case "Bearer ACCESS-2":
-				events.record("read-200")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":"backend-service","name":"Backend Service",` +
-					`"repo_url":"https://bitbucket.org/company/backend",` +
-					`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-02T09:00:00Z"}`))
-			default:
-				t.Errorf("Authorization = %q, want ACCESS-1 or ACCESS-2", r.Header.Get("Authorization"))
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}
-
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	if _, err := client.GetProject(t.Context(), "backend-service"); err != nil {
-		t.Fatalf("first GetProject() error = %v", err)
-	}
-	if _, err := client.GetProject(t.Context(), "backend-service"); err != nil {
-		t.Fatalf("second GetProject() error = %v", err)
-	}
-
-	got := events.all()
-	want := []string{"login", "read-200", "read-401", "refresh", "read-200"}
-	if !slices.Equal(got, want) {
-		t.Errorf("events = %v, want %v", got, want)
-	}
-	if logins := countEvents(got, "login"); logins != wantLoginCalls {
-		t.Errorf("login calls = %d, want %d", logins, wantLoginCalls)
-	}
-	if refreshes := countEvents(got, "refresh"); refreshes != wantRefreshCalls {
-		t.Errorf("refresh calls = %d, want exactly 1", refreshes)
-	}
-}
-
-// TestSecond401AfterRefreshIsUnauthorized checks the loop guard: when the
-// retried request 401s AGAIN after a successful refresh, the client reports
-// the typed ErrUnauthorized and never issues a third request or a second
-// refresh.
-func TestSecond401AfterRefreshIsUnauthorized(t *testing.T) {
-	t.Parallel()
-
-	const (
-		wantRefreshCalls = 1
-		wantReadCalls    = 2
-	)
-
-	events := &eventLog{}
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			events.record("login")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(alphaLoginFixture))
-		case "/api/v1/auth/refresh":
-			events.record("refresh")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"ACCESS-2","refresh_token":"ROTATED"}`))
-		case "/api/v1/projects/backend-service":
-			events.record("read-401")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}
-
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	_, err := client.GetProject(t.Context(), "backend-service")
-
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
-	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
-	}
-
-	got := events.all()
-	want := []string{"login", "read-401", "refresh", "read-401"}
-	if !slices.Equal(got, want) {
-		t.Errorf("events = %v, want %v (no third call)", got, want)
-	}
-	if refreshes := countEvents(got, "refresh"); refreshes != wantRefreshCalls {
-		t.Errorf("refresh calls = %d, want %d", refreshes, wantRefreshCalls)
-	}
-	if reads := countEvents(got, "read-401"); reads != wantReadCalls {
-		t.Errorf("project reads = %d, want %d (original + one retry)", reads, wantReadCalls)
-	}
-}
-
-// TestStaticWinsOverLogin checks precedence: with BOTH options set the
-// client attaches the static bearer and NEVER calls the login or refresh
-// endpoints; a 401 is reported as typed ErrUnauthorized.
-func TestStaticWinsOverLogin(t *testing.T) {
+// TestRefreshExchangesTokens checks the explicit in/out refresh: byte-exact
+// JSON body with the caller's refresh token, and a Tokens result carrying the
+// rotated pair - nothing is stored.
+func TestRefreshExchangesTokens(t *testing.T) {
 	t.Parallel()
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			t.Error("login endpoint hit in static-token mode, want no login ever")
-			w.WriteHeader(http.StatusInternalServerError)
-		case "/api/v1/auth/refresh":
-			t.Error("refresh endpoint hit in static-token mode, want no refresh ever")
-			w.WriteHeader(http.StatusInternalServerError)
-		case "/api/v1/projects/backend-service":
-			if got := r.Header.Get("Authorization"); got != "Bearer static-token" {
-				t.Errorf("Authorization = %q, want %q", got, "Bearer static-token")
-			}
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want %q", r.Method, http.MethodPost)
 		}
-	}
-
-	client := mustNew(
-		t,
-		newStubServer(t, handler),
-		clientgo.WithAccessToken("static-token"),
-		clientgo.WithLogin("u@x.example", "pw-secret"),
-	)
-
-	_, err := client.GetProject(t.Context(), "backend-service")
-
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
-	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
-	}
-}
-
-// TestConcurrentFirstUseLogsInOnce fires N goroutines at a cold client: the
-// login handler is held open until every goroutine has entered GetProject
-// (no access token can exist yet), so they all race into the single-flight
-// slot; exactly ONE login may happen and every request must succeed.
-func TestConcurrentFirstUseLogsInOnce(t *testing.T) {
-	t.Parallel()
-
-	const concurrentRequests = 8
-
-	var loginHits atomic.Int64
-	loginStarted := make(chan struct{})
-	loginRelease := make(chan struct{})
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			if loginHits.Add(1) == 1 {
-				close(loginStarted)
-			}
-			<-loginRelease
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(bootLoginFixture))
-		case "/api/v1/projects":
-			if got := r.Header.Get("Authorization"); got != "Bearer access-token-value" {
-				t.Errorf("Authorization = %q, want %q", got, "Bearer access-token-value")
-				w.WriteHeader(http.StatusInternalServerError)
-
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"items":[],"total":0}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			t.Errorf("path = %q, want %q", r.URL.Path, "/api/v1/auth/refresh")
 		}
-	}
-
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	started := make(chan struct{}, concurrentRequests)
-	errs := make([]error, concurrentRequests)
-	var wg sync.WaitGroup
-	for i := range concurrentRequests {
-		wg.Go(func() {
-			started <- struct{}{}
-			_, _, errs[i] = client.ListProjects(t.Context())
-		})
-	}
-
-	// The leader is now inside the login handler (no token issued yet) and
-	// every goroutine has entered its request: they must all join the same
-	// flight. Only then release the handler.
-	<-loginStarted
-	for range concurrentRequests {
-		<-started
-	}
-	close(loginRelease)
-	wg.Wait()
-
-	for i, err := range errs {
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Errorf("goroutine %d: ListProjects() error = %v", i, err)
+			t.Errorf("read body: %v", err)
+			return
 		}
-	}
-	if got := loginHits.Load(); got != 1 {
-		t.Errorf("login calls = %d, want exactly 1 (single-flight first use)", got)
-	}
-}
-
-// TestConcurrentRefreshSingleFlight fires N goroutines at a revoked access
-// token simultaneously: the refresh handler is held until every goroutine
-// has received its 401, so the race window is guaranteed, and the atomic
-// counter proves exactly ONE refresh (and one first-use login) happened
-// while all requests still succeeded on their single retry.
-func TestConcurrentRefreshSingleFlight(t *testing.T) {
-	t.Parallel()
-
-	const concurrentRequests = 8
-
-	var loginHits, refreshHits, unauthorized atomic.Int64
-	release := make(chan struct{})
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			loginHits.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(bootLoginFixture))
-		case "/api/v1/auth/refresh":
-			<-release
-			refreshHits.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
-		case "/api/v1/projects/backend-service":
-			switch r.Header.Get("Authorization") {
-			case "Bearer access-token-value":
-				if unauthorized.Add(1) == concurrentRequests {
-					close(release)
-				}
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-			case "Bearer ACCESS-B":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"items":[],"total":0}`))
-			default:
-				t.Errorf("Authorization = %q, want access-token-value or ACCESS-B", r.Header.Get("Authorization"))
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+		const wantBody = `{"refresh_token":"REFRESH-0"}`
+		if string(body) != wantBody {
+			t.Errorf("body = %q, want %q", string(body), wantBody)
 		}
-	}
 
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	errs := make([]error, concurrentRequests)
-	var wg sync.WaitGroup
-	for i := range concurrentRequests {
-		wg.Go(func() {
-			_, errs[i] = client.GetProject(t.Context(), "backend-service")
-		})
-	}
-	wg.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("goroutine %d: GetProject() error = %v", i, err)
-		}
-	}
-	if got := loginHits.Load(); got != 1 {
-		t.Errorf("login calls = %d, want exactly 1", got)
-	}
-	if got := refreshHits.Load(); got != 1 {
-		t.Errorf("refresh calls = %d, want exactly 1 (single-flight)", got)
-	}
-	if got := unauthorized.Load(); got != concurrentRequests {
-		t.Errorf("401 responses = %d, want %d (every goroutine raced)", got, concurrentRequests)
-	}
-}
-
-// TestLeaderCancellationDoesNotFailSharedFlight cancels the LEADER's context
-// while the shared login is still gated inside the handler: the leader must
-// return immediately, while the flight keeps running on its own detached,
-// bounded context — so every waiter still succeeds, exactly ONE login
-// happens and the tokens are stored. Only the leader's own request fails,
-// because its context was cancelled.
-func TestLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
-	t.Parallel()
-
-	const waiters = 7
-
-	var loginHits atomic.Int64
-	loginStarted := make(chan struct{})
-	loginRelease := make(chan struct{})
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			if loginHits.Add(1) == 1 {
-				close(loginStarted)
-			}
-			<-loginRelease
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(bootLoginFixture))
-		case "/api/v1/projects":
-			if got := r.Header.Get("Authorization"); got != "Bearer access-token-value" {
-				t.Errorf("Authorization = %q, want %q", got, "Bearer access-token-value")
-				w.WriteHeader(http.StatusInternalServerError)
-
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"items":[],"total":0}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}
-
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	// The gate must open before srv.Close waits on the handler, even when the
-	// test bails out early: t.Cleanup runs in LIFO order.
-	releaseLogin := sync.OnceFunc(func() { close(loginRelease) })
-	t.Cleanup(releaseLogin)
-
-	leaderCtx, leaderCancel := context.WithCancel(t.Context())
-	defer leaderCancel()
-
-	leaderDone := make(chan error, 1)
-	go func() {
-		_, _, err := client.ListProjects(leaderCtx)
-		leaderDone <- err
-	}()
-
-	// The leader is now inside the login handler (no token issued yet): start
-	// the waiters so they join the SAME flight, then cancel only the leader.
-	<-loginStarted
-
-	started := make(chan struct{}, waiters)
-	errs := make([]error, waiters)
-	var wg sync.WaitGroup
-	for i := range waiters {
-		wg.Go(func() {
-			started <- struct{}{}
-			_, _, errs[i] = client.ListProjects(t.Context())
-		})
-	}
-	for range waiters {
-		<-started
-	}
-	leaderCancel()
-
-	// The cancelled leader must return WHILE the login gate is still closed;
-	// only then is the early-return guarantee exercised.
-	var leaderErr error
-	select {
-	case leaderErr = <-leaderDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled leader still blocked on the gated login")
-	}
-	releaseLogin()
-
-	wg.Wait()
-
-	if leaderErr == nil {
-		t.Errorf("leader ListProjects() error = nil, want failure from its cancelled context")
-	}
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("waiter %d: ListProjects() error = %v", i, err)
-		}
-	}
-	if got := loginHits.Load(); got != 1 {
-		t.Errorf("login calls = %d, want exactly 1 (flight survives leader cancellation)", got)
-	}
-}
-
-// TestRefreshLeaderCancellationDoesNotFailSharedFlight is the refresh twin of
-// TestLeaderCancellationDoesNotFailSharedFlight: cancelling the leader while
-// the rotation is gated must return the leader immediately WITHOUT aborting
-// the shared refresh, so waiters retry with the NEW access token, exactly ONE
-// refresh happens and the rotated refresh token is stored — only the leader's
-// own request fails.
-func TestRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
-	t.Parallel()
-
-	const waiters = 7
-
-	var refreshHits atomic.Int64
-	refreshStarted := make(chan struct{})
-	refreshRelease := make(chan struct{})
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(bootLoginFixture))
-		case "/api/v1/auth/refresh":
-			if refreshHits.Add(1) == 1 {
-				close(refreshStarted)
-			}
-			<-refreshRelease
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
-		case "/api/v1/projects/backend-service":
-			switch r.Header.Get("Authorization") {
-			case "Bearer access-token-value":
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-			case "Bearer ACCESS-B":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"items":[],"total":0}`))
-			default:
-				t.Errorf("Authorization = %q, want access-token-value or ACCESS-B", r.Header.Get("Authorization"))
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}
-
-	client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-	// The gate must open before srv.Close waits on the handler, even when the
-	// test bails out early: t.Cleanup runs in LIFO order.
-	releaseRefresh := sync.OnceFunc(func() { close(refreshRelease) })
-	t.Cleanup(releaseRefresh)
-
-	leaderCtx, leaderCancel := context.WithCancel(t.Context())
-	defer leaderCancel()
-
-	leaderDone := make(chan error, 1)
-	go func() {
-		_, err := client.GetProject(leaderCtx, "backend-service")
-		leaderDone <- err
-	}()
-
-	// The leader is now inside the refresh handler (the old access token is
-	// still the live one): start the waiters so they 401 and join the SAME
-	// flight, then cancel only the leader.
-	<-refreshStarted
-
-	started := make(chan struct{}, waiters)
-	errs := make([]error, waiters)
-	var wg sync.WaitGroup
-	for i := range waiters {
-		wg.Go(func() {
-			started <- struct{}{}
-			_, errs[i] = client.GetProject(t.Context(), "backend-service")
-		})
-	}
-	for range waiters {
-		<-started
-	}
-	leaderCancel()
-
-	// The cancelled leader must return WHILE the refresh gate is still
-	// closed; only then is the early-return guarantee exercised.
-	var leaderErr error
-	select {
-	case leaderErr = <-leaderDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled leader still blocked on the gated refresh")
-	}
-	releaseRefresh()
-
-	wg.Wait()
-
-	if leaderErr == nil {
-		t.Errorf("leader GetProject() error = nil, want failure from its cancelled context")
-	}
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("waiter %d: GetProject() error = %v", i, err)
-		}
-	}
-	if got := refreshHits.Load(); got != 1 {
-		t.Errorf("refresh calls = %d, want exactly 1 (flight survives leader cancellation)", got)
-	}
-}
-
-// TestNoCredentialsNeverLogin checks the no-credential path: without any
-// option the request goes out with no bearer, the 401 is reported as typed
-// ErrUnauthorized, and neither the login nor the refresh endpoint is ever
-// called.
-func TestNoCredentialsNeverLogin(t *testing.T) {
-	t.Parallel()
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/auth/login":
-			t.Error("login endpoint hit without credentials, want none")
-			w.WriteHeader(http.StatusInternalServerError)
-		case "/api/v1/auth/refresh":
-			t.Error("refresh endpoint hit without credentials, want none")
-			w.WriteHeader(http.StatusInternalServerError)
-		case "/api/v1/projects/backend-service":
-			if got := r.Header.Get("Authorization"); got != "" {
-				t.Errorf("Authorization = %q, want empty", got)
-			}
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-		default:
-			t.Errorf("unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"ACCESS-2","refresh_token":"ROTATED"}`))
 	}
 
 	client := mustNew(t, newStubServer(t, handler))
 
-	_, err := client.GetProject(t.Context(), "backend-service")
+	tokens, err := client.Refresh(t.Context(), "REFRESH-0")
 
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
 	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
+	if tokens.AccessToken != "ACCESS-2" {
+		t.Errorf("AccessToken = %q, want %q", tokens.AccessToken, "ACCESS-2")
+	}
+	if tokens.RefreshToken != "ROTATED" {
+		t.Errorf("RefreshToken = %q, want %q", tokens.RefreshToken, "ROTATED")
 	}
 }
 
-// TestNewRejectsEmptyLogin checks New refuses WithLogin with an empty email
-// or password (or both) with the typed ErrInvalidCredentials and a nil
-// client, instead of failing at the first request.
-func TestNewRejectsEmptyLogin(t *testing.T) {
+// TestRefreshRejectedIsSessionExpired checks a refresh token the backend
+// rejects (401) classifies as ErrSessionExpired - while a 5xx keeps the
+// transient ErrServer sentinel instead.
+func TestRefreshRejectedIsSessionExpired(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name     string
-		email    string
-		password string
+		name        string
+		status      int
+		body        string
+		wantSent    error
+		wantNotSent error
 	}{
-		{name: "empty email", email: "", password: "pw-secret"},
-		{name: "empty password", email: "u@x.example", password: ""},
-		{name: "both empty", email: "", password: ""},
+		{
+			name:     "401 rejected token is session expired",
+			status:   http.StatusUnauthorized,
+			body:     `{"message":"refresh token revoked"}`,
+			wantSent: clientgo.ErrSessionExpired,
+		},
+		{
+			name:        "500 stays a transient server error",
+			status:      http.StatusInternalServerError,
+			body:        `{"message":"boom"}`,
+			wantSent:    clientgo.ErrServer,
+			wantNotSent: clientgo.ErrSessionExpired,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			client, err := clientgo.New("http://localhost:3000", clientgo.WithLogin(tc.email, tc.password))
-
-			if client != nil {
-				t.Errorf("client = %v, want nil", client)
+			handler := func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
 			}
-			if !errors.Is(err, clientgo.ErrInvalidCredentials) {
-				t.Errorf("errors.Is(err, ErrInvalidCredentials) = false, err = %v", err)
+			client := mustNew(t, newStubServer(t, handler))
+
+			_, err := client.Refresh(t.Context(), "REFRESH-0")
+
+			if !errors.Is(err, tc.wantSent) {
+				t.Fatalf("errors.Is(err, %v) = false, err = %v", tc.wantSent, err)
+			}
+			if tc.wantNotSent != nil && errors.Is(err, tc.wantNotSent) {
+				t.Errorf("errors.Is(err, %v) = true, err = %v", tc.wantNotSent, err)
 			}
 		})
 	}
 }
 
-// TestErrorStringsLeakNoSecrets scans every error the suite can provoke
-// against the password and both token values: no returned error string may
-// contain any of them.
-func TestErrorStringsLeakNoSecrets(t *testing.T) {
+// TestLogoutRevokesAndEmptyIsNoOp checks POST /api/v1/auth/logout: the 204
+// EMPTY body is never decoded (a decode attempt would surface an error), the
+// body is byte-exact, and an empty refresh token is a no-op that sends no
+// request at all.
+func TestLogoutRevokesAndEmptyIsNoOp(t *testing.T) {
 	t.Parallel()
 
-	forbidden := []string{"pw-secret", "ACCESS-1", "ACCESS-2", "REFRESH-0"}
-
-	assertNoLeak := func(t *testing.T, err error) {
-		t.Helper()
-
-		if err == nil {
-			t.Fatal("error = nil, want an error to scan")
-		}
-		for _, secret := range forbidden {
-			if strings.Contains(err.Error(), secret) {
-				t.Errorf("err.Error() leaks %q: %q", secret, err.Error())
-			}
-		}
-	}
-
-	t.Run("login 401", func(t *testing.T) {
-		t.Parallel()
-
-		handler := func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"message":"invalid credentials"}`))
-		}
-		client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
-
-		_, err := client.GetProject(t.Context(), "backend-service")
-
-		assertNoLeak(t, err)
-	})
-
-	t.Run("login transport failure", func(t *testing.T) {
-		t.Parallel()
-
-		srv := httptest.NewServer(http.NotFoundHandler())
-		baseURL := srv.URL
-		srv.Close()
-
-		client := mustNew(t, baseURL, clientgo.WithLogin("u@x.example", "pw-secret"),
-			clientgo.WithHTTPClient(&http.Client{Transport: &http.Transport{Proxy: nil}}))
-
-		_, err := client.GetProject(t.Context(), "backend-service")
-
-		assertNoLeak(t, err)
-	})
-
-	t.Run("refresh 401", func(t *testing.T) {
+	t.Run("revokes with the given token", func(t *testing.T) {
 		t.Parallel()
 
 		handler := func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/api/v1/auth/login":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(alphaLoginFixture))
-			case "/api/v1/auth/refresh":
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"refresh token rejected"}`))
-			default:
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
+			if r.Method != http.MethodPost {
+				t.Errorf("method = %q, want %q", r.Method, http.MethodPost)
 			}
+			if r.URL.Path != "/api/v1/auth/logout" {
+				t.Errorf("path = %q, want %q", r.URL.Path, "/api/v1/auth/logout")
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read body: %v", err)
+				return
+			}
+			const wantBody = `{"refresh_token":"REFRESH-0"}`
+			if string(body) != wantBody {
+				t.Errorf("body = %q, want %q", string(body), wantBody)
+			}
+
+			w.WriteHeader(http.StatusNoContent)
 		}
-		client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
 
-		_, err := client.GetProject(t.Context(), "backend-service")
+		client := mustNew(t, newStubServer(t, handler))
 
-		assertNoLeak(t, err)
+		if err := client.Logout(t.Context(), "REFRESH-0"); err != nil {
+			t.Fatalf("Logout() error = %v, want nil for 204 with empty body", err)
+		}
 	})
 
-	t.Run("second 401 after refresh", func(t *testing.T) {
+	t.Run("empty token is a no-op", func(t *testing.T) {
 		t.Parallel()
 
 		handler := func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/api/v1/auth/login":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(alphaLoginFixture))
-			case "/api/v1/auth/refresh":
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"access_token":"ACCESS-2","refresh_token":"ROTATED"}`))
-			default:
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
-			}
+			t.Errorf("unexpected request %s %s, want none for an empty token", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		client := mustNew(t, newStubServer(t, handler), clientgo.WithLogin("u@x.example", "pw-secret"))
 
-		_, err := client.GetProject(t.Context(), "backend-service")
+		client := mustNew(t, newStubServer(t, handler))
 
-		assertNoLeak(t, err)
+		if err := client.Logout(t.Context(), ""); err != nil {
+			t.Fatalf("Logout() error = %v, want nil", err)
+		}
 	})
 }
 
