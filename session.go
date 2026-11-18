@@ -21,6 +21,7 @@ type Session struct {
 	refreshToken string
 	generation   uint64
 	inflight     *sessionFlight
+	loggedOut    bool
 }
 
 // NewSession returns a Session for baseURL (validated exactly like New) that
@@ -41,6 +42,7 @@ func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error)
 		refreshToken: tokens.RefreshToken,
 		generation:   0,
 		inflight:     nil,
+		loggedOut:    false,
 	}, nil
 }
 
@@ -69,11 +71,39 @@ func (s *Session) Tokens() Tokens {
 
 // Logout revokes the in-memory refresh token via the stateless client (the
 // API answers 204 with an EMPTY body, which is never decoded) and then
-// clears BOTH tokens in memory. With no refresh token in memory the HTTP
-// call is skipped (stateless no-op) and the memory clear still runs. A
-// failed revoke keeps the tokens so the caller may retry.
+// clears BOTH tokens in memory. It is coordinated with the single-flight
+// refresh: any in-flight rotation is awaited first (so the FINAL refresh
+// token - rotated or original - is the one revoked), and while the logout
+// runs no new refresh may fly or store tokens, so a completing rotation can
+// never restore credentials after the clear. With no refresh token in
+// memory the HTTP call is skipped (stateless no-op) and the memory clear
+// still runs. A failed revoke (or an aborted wait) keeps the tokens so the
+// caller may retry.
 func (s *Session) Logout(ctx context.Context) error {
+	s.mu.Lock()
+	s.loggedOut = true
+	flight := s.inflight
+	s.mu.Unlock()
+
+	if flight != nil {
+		// The flight's own result does not change what gets revoked - the
+		// in-memory token does - so only an aborted wait returns here.
+		select {
+		case <-flight.done:
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.loggedOut = false
+			s.mu.Unlock()
+
+			return fmt.Errorf("wait for auth flow: %w", ctx.Err())
+		}
+	}
+
 	if err := s.client.Logout(ctx, s.currentRefreshToken()); err != nil {
+		s.mu.Lock()
+		s.loggedOut = false
+		s.mu.Unlock()
+
 		return err
 	}
 
@@ -176,13 +206,21 @@ func (s *Session) refreshAfterUnauthorized(ctx context.Context, gen uint64) (boo
 // caller becomes the leader and starts the flight, concurrent callers wait
 // on the same flight and share its result (stdlib [sync.Mutex] only). An
 // already-advanced generation means another rotation landed after the
-// caller's request started, so its result is reused without a new call. The
-// flight runs on a detached, bounded context (see [flightContext]) and every
-// caller waits through [waitFlight]: a cancelled leader returns immediately
-// without failing the waiters, and the rotation still completes and stores
-// its tokens - the Session is never left holding a revoked refresh token.
+// caller's request started, so its result is reused without a new call. A
+// logout in progress (or completed) declines new flights so no rotation can
+// race the revoke or restore credentials after the clear. The flight runs on
+// a detached, bounded context (see [flightContext]) and every caller waits
+// through [waitFlight]: a cancelled leader returns immediately without
+// failing the waiters, and the rotation still completes and stores its
+// tokens - the Session is never left holding a revoked refresh token.
 func (s *Session) refreshOnce(ctx context.Context, gen uint64) error {
 	s.mu.Lock()
+
+	if s.loggedOut {
+		s.mu.Unlock()
+
+		return fmt.Errorf("%w: session is being revoked", ErrSessionExpired)
+	}
 
 	if s.generation != gen {
 		s.mu.Unlock()

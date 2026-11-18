@@ -416,6 +416,99 @@ func TestSessionLogoutRevokesAndClears(t *testing.T) {
 	}
 }
 
+// TestSessionLogoutWaitsForFlightAndRevokesRotatedToken checks (12): Logout
+// coordinated with the single-flight refresh waits for a gated rotation to
+// complete, revokes the FINAL (rotated) refresh token, and leaves Tokens()
+// empty - a completing refresh can never restore credentials after logout.
+// The revoked body is the deterministic ordering proof: only a logout that
+// waited for the flight can observe the rotated token.
+func TestSessionLogoutWaitsForFlightAndRevokesRotatedToken(t *testing.T) {
+	t.Parallel()
+
+	var (
+		refreshHits    atomic.Int64
+		rotatedRevoked atomic.Bool
+	)
+
+	refreshStarted := make(chan struct{})
+	refreshRelease := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			if refreshHits.Add(1) == 1 {
+				close(refreshStarted)
+			}
+			<-refreshRelease
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
+		case "/api/v1/auth/logout":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read body: %v", err)
+				return
+			}
+			if string(body) != `{"refresh_token":"ROTATED"}` {
+				t.Errorf("logout body = %q, want the rotated token revoked", string(body))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			rotatedRevoked.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/projects/backend-service":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		AccessToken:  "access-token-value",
+		RefreshToken: "refresh-token-value",
+	})
+
+	// The gate must open before srv.Close waits on the handler, even when
+	// the test bails out early: t.Cleanup runs in LIFO order.
+	releaseRefresh := sync.OnceFunc(func() { close(refreshRelease) })
+	t.Cleanup(releaseRefresh)
+
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		// The read 401s into a gated refresh; its own result is irrelevant
+		// here - the flight it starts is what the logout must wait for.
+		_, _ = session.GetProject(t.Context(), "backend-service")
+	}()
+
+	// The refresh flight is now gated: start the logout so it overlaps the
+	// rotation, then release the gate.
+	<-refreshStarted
+
+	logoutDone := make(chan error, 1)
+	go func() {
+		logoutDone <- session.Logout(t.Context())
+	}()
+
+	releaseRefresh()
+
+	if err := <-logoutDone; err != nil {
+		t.Fatalf("Logout() error = %v", err)
+	}
+	<-readerDone
+
+	if !rotatedRevoked.Load() {
+		t.Error("the rotated refresh token was never revoked")
+	}
+	if got := session.Tokens(); got != (clientgo.Tokens{}) {
+		t.Errorf("Tokens() after Logout = %+v, want the pair cleared", got)
+	}
+	if got := refreshHits.Load(); got != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", got)
+	}
+}
+
 // TestSessionConcurrentRefreshSingleFlight checks (9): N goroutines hitting a
 // revoked access token simultaneously cause exactly ONE refresh (the handler
 // is held until every goroutine received its 401, so the race window is
