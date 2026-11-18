@@ -349,6 +349,15 @@ func TestGetTaskDetails(t *testing.T) {
 	if details.Attachments[0].DownloadURL == "" {
 		t.Error("attachments[0].DownloadURL is empty, want the presigned URL kept in the DTO")
 	}
+	if len(details.Comments) != 1 {
+		t.Fatalf("len(details.Comments) = %d, want 1", len(details.Comments))
+	}
+	if details.Comments[0].ID != 9 || details.Comments[0].Content != "Reproduced on staging." {
+		t.Errorf("comments[0] = %+v, want ID 9 with the staged content", details.Comments[0])
+	}
+	if details.Comments[0].Author.Name != "bob" {
+		t.Errorf("comments[0].Author = %+v, want name bob", details.Comments[0].Author)
+	}
 }
 
 // TestBaseURLWithPathPrefix checks the join is clean when the base URL carries
@@ -456,6 +465,15 @@ const taskDetailsFixture = `{
 			"uploaded_by": {"id": 1, "name": "alice", "role": "admin", "created_at": "2026-01-01T00:00:00Z"},
 			"uploaded_at": "2026-04-01T11:00:00Z",
 			"download_url": "https://minio.example.com/bucket/log.txt?X-Amz-Signature=abc"
+		}
+	],
+	"comments": [
+		{
+			"id": 9,
+			"author": {"id": 2, "name": "bob", "role": "user", "created_at": "2026-01-02T00:00:00Z"},
+			"content": "Reproduced on staging.",
+			"created_at": "2026-04-02T10:00:00Z",
+			"updated_at": "2026-04-02T10:00:00Z"
 		}
 	]
 }`

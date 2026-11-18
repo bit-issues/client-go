@@ -24,6 +24,7 @@ type TaskDetailsResponse struct {
 
 	Project     *Project             `json:"project"`
 	Attachments []AttachmentResponse `json:"attachments"`
+	Comments    []CommentResponse    `json:"comments"`
 }
 
 // TaskListResponse represents the API response for a list of tasks.
