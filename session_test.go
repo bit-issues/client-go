@@ -602,6 +602,73 @@ func TestSessionConcurrentLogoutIsSerialized(t *testing.T) {
 	}
 }
 
+// TestSessionLogoutOwnershipIsCancellable checks that a logout cancelled while
+// another logout owns the gate returns immediately, with no revoke and no
+// change to the refresh guard.
+func TestSessionLogoutOwnershipIsCancellable(t *testing.T) {
+	t.Parallel()
+
+	var revokeHits atomic.Int64
+
+	revokeStarted := make(chan struct{})
+	revokeRelease := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/logout":
+			revokeHits.Add(1)
+			close(revokeStarted)
+			<-revokeRelease
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		AccessToken:  "access-token-value",
+		RefreshToken: "refresh-token-value",
+	})
+
+	releaseRevoke := sync.OnceFunc(func() { close(revokeRelease) })
+	t.Cleanup(releaseRevoke)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- session.Logout(t.Context())
+	}()
+	<-revokeStarted
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- session.Logout(ctx)
+	}()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("second Logout() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second Logout blocked while its context was already cancelled")
+	}
+
+	releaseRevoke()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Logout() error = %v", err)
+	}
+	if got := revokeHits.Load(); got != 1 {
+		t.Errorf("revoke calls = %d, want 1 (the cancelled logout must not revoke)", got)
+	}
+	if got := session.Tokens(); got != (clientgo.Tokens{}) {
+		t.Errorf("Tokens() after Logout = %+v, want the pair cleared", got)
+	}
+}
+
 // TestSessionAuthPathWithoutLeadingSlash checks that a caller-supplied auth
 // endpoint is excluded from refresh/retry after path normalization.
 func TestSessionAuthPathWithoutLeadingSlash(t *testing.T) {

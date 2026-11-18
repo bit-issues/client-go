@@ -22,7 +22,7 @@ type Session struct {
 	generation   uint64
 	inflight     *sessionFlight
 	loggedOut    bool
-	logoutMu     sync.Mutex
+	logoutGate   chan struct{}
 }
 
 // NewSession returns a Session for baseURL (validated exactly like New) that
@@ -44,7 +44,7 @@ func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error)
 		generation:   0,
 		inflight:     nil,
 		loggedOut:    false,
-		logoutMu:     sync.Mutex{},
+		logoutGate:   make(chan struct{}, 1),
 	}, nil
 }
 
@@ -80,15 +80,15 @@ func (s *Session) Tokens() Tokens {
 // never restore credentials after the clear. With no refresh token in
 // memory the HTTP call is skipped (stateless no-op) and the memory clear
 // still runs. A failed revoke (or an aborted wait) keeps the tokens so the
-// caller may retry. Concurrent logouts are serialized, so the guard always
-// has a single owner; a cancelled caller waiting for that ownership returns
-// immediately.
+// caller may retry. Concurrent logouts are serialized by a context-aware gate,
+// so the guard has a single owner; a caller cancelled while waiting for that
+// ownership returns immediately without changing any state.
 func (s *Session) Logout(ctx context.Context) (err error) {
-	s.logoutMu.Lock()
-	defer s.logoutMu.Unlock()
-
-	if cancelled := ctx.Err(); cancelled != nil {
-		return fmt.Errorf("logout context: %w", cancelled)
+	select {
+	case s.logoutGate <- struct{}{}:
+		defer func() { <-s.logoutGate }()
+	case <-ctx.Done():
+		return fmt.Errorf("logout ownership: %w", ctx.Err())
 	}
 
 	s.mu.Lock()
