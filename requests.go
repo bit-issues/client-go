@@ -83,15 +83,19 @@ func taskListQuery(params ListTasksParams) url.Values {
 	return query
 }
 
+// requestPath returns the canonical leading-slash form of an endpoint path.
+func requestPath(path string) string {
+	if strings.HasPrefix(path, "/") {
+		return path
+	}
+
+	return "/" + path
+}
+
 // requestURL joins the base URL, an API path and optional query parameters
 // without producing duplicate slashes.
 func requestURL(baseURL, path string, query url.Values) string {
-	joined := strings.TrimRight(baseURL, "/")
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	joined += path
+	joined := strings.TrimRight(baseURL, "/") + requestPath(path)
 	if len(query) == 0 {
 		return joined
 	}

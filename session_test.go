@@ -417,16 +417,18 @@ func TestSessionLogoutRevokesAndClears(t *testing.T) {
 }
 
 // TestSessionLogoutWaitsForFlightAndRevokesRotatedToken checks (12): Logout
-// coordinated with the single-flight refresh waits for a gated rotation to
-// complete, revokes the FINAL (rotated) refresh token, and leaves Tokens()
-// empty - a completing refresh can never restore credentials after logout.
-// The revoked body is the deterministic ordering proof: only a logout that
-// waited for the flight can observe the rotated token.
+// waits for a gated rotation before revoking, revokes the FINAL (rotated)
+// refresh token, and leaves Tokens() empty - a completing refresh can never
+// restore credentials after logout. The bounded first logout is the
+// deterministic wait proof: the gate is still closed, so a deadline error can
+// only come from the flight-wait abort path; a later logout revokes the token
+// stored by the completed rotation.
 func TestSessionLogoutWaitsForFlightAndRevokesRotatedToken(t *testing.T) {
 	t.Parallel()
 
 	var (
 		refreshHits    atomic.Int64
+		logoutHits     atomic.Int64
 		rotatedRevoked atomic.Bool
 	)
 
@@ -443,6 +445,7 @@ func TestSessionLogoutWaitsForFlightAndRevokesRotatedToken(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
 		case "/api/v1/auth/logout":
+			logoutHits.Add(1)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				t.Errorf("read body: %v", err)
@@ -482,30 +485,156 @@ func TestSessionLogoutWaitsForFlightAndRevokesRotatedToken(t *testing.T) {
 		_, _ = session.GetProject(t.Context(), "backend-service")
 	}()
 
-	// The refresh flight is now gated: start the logout so it overlaps the
-	// rotation, then release the gate.
+	// The refresh flight is now gated. A logout bounded by a short deadline
+	// must be blocked by it: the gate cannot open before this call returns,
+	// so the deadline error proves the wait regardless of goroutine order.
 	<-refreshStarted
 
-	logoutDone := make(chan error, 1)
-	go func() {
-		logoutDone <- session.Logout(t.Context())
-	}()
+	logoutCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
 
+	if err := session.Logout(logoutCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Logout() error = %v, want deadline exceeded while refresh is gated", err)
+	}
+	if got := session.Tokens(); got.RefreshToken != "refresh-token-value" {
+		t.Errorf("Tokens() after aborted Logout = %+v, want the original pair kept", got)
+	}
+
+	// The aborted wait keeps the session retryable; let the rotation finish
+	// and store the rotated pair, then revoke it with a fresh logout.
 	releaseRefresh()
+	<-readerDone
 
-	if err := <-logoutDone; err != nil {
+	if err := session.Logout(t.Context()); err != nil {
 		t.Fatalf("Logout() error = %v", err)
 	}
-	<-readerDone
 
 	if !rotatedRevoked.Load() {
 		t.Error("the rotated refresh token was never revoked")
+	}
+	if got := logoutHits.Load(); got != 1 {
+		t.Errorf("logout calls = %d, want 1 (the aborted logout must not revoke)", got)
 	}
 	if got := session.Tokens(); got != (clientgo.Tokens{}) {
 		t.Errorf("Tokens() after Logout = %+v, want the pair cleared", got)
 	}
 	if got := refreshHits.Load(); got != 1 {
 		t.Errorf("refresh calls = %d, want exactly 1", got)
+	}
+}
+
+// TestSessionConcurrentLogoutIsSerialized checks that overlapping logouts
+// share one guard: the second waits for the first, then no-ops on empty
+// tokens instead of revoking concurrently while a refresh could still land.
+func TestSessionConcurrentLogoutIsSerialized(t *testing.T) {
+	t.Parallel()
+
+	var (
+		refreshHits atomic.Int64
+		revokeHits  atomic.Int64
+	)
+
+	revokeStarted := make(chan struct{})
+	revokeRelease := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/logout":
+			if revokeHits.Add(1) == 1 {
+				close(revokeStarted)
+				<-revokeRelease
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/projects/backend-service":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"missing or expired token"}`))
+		case "/api/v1/auth/refresh":
+			refreshHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		AccessToken:  "access-token-value",
+		RefreshToken: "refresh-token-value",
+	})
+
+	// The first revoke is gated so the second logout must wait for it;
+	// LIFO cleanup opens the gate before srv.Close.
+	releaseRevoke := sync.OnceFunc(func() { close(revokeRelease) })
+	t.Cleanup(releaseRevoke)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- session.Logout(t.Context())
+	}()
+	<-revokeStarted
+
+	if _, err := session.GetProject(t.Context(), "backend-service"); !errors.Is(err, clientgo.ErrSessionExpired) {
+		t.Errorf("GetProject() error = %v, want ErrSessionExpired while a logout is running", err)
+	}
+	if got := refreshHits.Load(); got != 0 {
+		t.Errorf("refresh calls = %d, want 0 while a logout is running", got)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- session.Logout(t.Context())
+	}()
+
+	releaseRevoke()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Logout() error = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Logout() error = %v", err)
+	}
+
+	if got := revokeHits.Load(); got != 1 {
+		t.Errorf("revoke calls = %d, want 1 (the second logout must skip empty tokens)", got)
+	}
+	if got := session.Tokens(); got != (clientgo.Tokens{}) {
+		t.Errorf("Tokens() after Logout = %+v, want the pair cleared", got)
+	}
+}
+
+// TestSessionAuthPathWithoutLeadingSlash checks that a caller-supplied auth
+// endpoint is excluded from refresh/retry after path normalization.
+func TestSessionAuthPathWithoutLeadingSlash(t *testing.T) {
+	t.Parallel()
+
+	var refreshHits atomic.Int64
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"bad credentials"}`))
+		case "/api/v1/auth/refresh":
+			refreshHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"ACCESS-B","refresh_token":"ROTATED"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		AccessToken:  "ACCESS-1",
+		RefreshToken: "REFRESH-1",
+	})
+
+	err := session.Do(t.Context(), http.MethodPost, "api/v1/auth/login", nil, nil, nil)
+	if !errors.Is(err, clientgo.ErrUnauthorized) {
+		t.Fatalf("Do() error = %v, want ErrUnauthorized", err)
+	}
+	if got := refreshHits.Load(); got != 0 {
+		t.Errorf("refresh calls = %d, want 0 for an auth endpoint", got)
 	}
 }
 

@@ -22,6 +22,7 @@ type Session struct {
 	generation   uint64
 	inflight     *sessionFlight
 	loggedOut    bool
+	logoutMu     sync.Mutex
 }
 
 // NewSession returns a Session for baseURL (validated exactly like New) that
@@ -43,6 +44,7 @@ func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error)
 		generation:   0,
 		inflight:     nil,
 		loggedOut:    false,
+		logoutMu:     sync.Mutex{},
 	}, nil
 }
 
@@ -78,12 +80,29 @@ func (s *Session) Tokens() Tokens {
 // never restore credentials after the clear. With no refresh token in
 // memory the HTTP call is skipped (stateless no-op) and the memory clear
 // still runs. A failed revoke (or an aborted wait) keeps the tokens so the
-// caller may retry.
-func (s *Session) Logout(ctx context.Context) error {
+// caller may retry. Concurrent logouts are serialized, so the guard always
+// has a single owner; a cancelled caller waiting for that ownership returns
+// immediately.
+func (s *Session) Logout(ctx context.Context) (err error) {
+	s.logoutMu.Lock()
+	defer s.logoutMu.Unlock()
+
+	if cancelled := ctx.Err(); cancelled != nil {
+		return fmt.Errorf("logout context: %w", cancelled)
+	}
+
 	s.mu.Lock()
 	s.loggedOut = true
 	flight := s.inflight
 	s.mu.Unlock()
+
+	defer func() {
+		if err != nil {
+			s.mu.Lock()
+			s.loggedOut = false
+			s.mu.Unlock()
+		}
+	}()
 
 	if flight != nil {
 		// The flight's own result does not change what gets revoked - the
@@ -91,19 +110,11 @@ func (s *Session) Logout(ctx context.Context) error {
 		select {
 		case <-flight.done:
 		case <-ctx.Done():
-			s.mu.Lock()
-			s.loggedOut = false
-			s.mu.Unlock()
-
 			return fmt.Errorf("wait for auth flow: %w", ctx.Err())
 		}
 	}
 
-	if err := s.client.Logout(ctx, s.currentRefreshToken()); err != nil {
-		s.mu.Lock()
-		s.loggedOut = false
-		s.mu.Unlock()
-
+	if err = s.client.Logout(ctx, s.currentRefreshToken()); err != nil {
 		return err
 	}
 
@@ -155,14 +166,16 @@ func (s *Session) do(
 	payload, response any,
 	retried bool,
 ) error {
+	endpoint := requestPath(path)
+
 	gen, token := s.credentialState()
 
-	status, body, err := s.client.roundTrip(ctx, method, requestURL(s.client.baseURL, path, query), payload, token)
+	status, body, err := s.client.roundTrip(ctx, method, requestURL(s.client.baseURL, endpoint, query), payload, token)
 	if err != nil {
 		return err
 	}
 
-	if status == http.StatusUnauthorized && !retried && !isAuthPath(path) {
+	if status == http.StatusUnauthorized && !retried && !isAuthPath(endpoint) {
 		canRetry, refreshErr := s.refreshAfterUnauthorized(ctx, gen)
 		if refreshErr != nil {
 			return refreshErr
