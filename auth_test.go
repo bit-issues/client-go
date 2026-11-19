@@ -10,7 +10,7 @@ import (
 	clientgo "github.com/bit-issues/client-go"
 )
 
-// loginOKFixture is the wire payload of a successful POST /api/v1/auth/login.
+// loginOKFixture is the wire payload of a successful POST /auth/login.
 const loginOKFixture = `{"access_token":"ACCESS-1","refresh_token":"REFRESH-0",` +
 	`"user":{"id":1,"email":"u@x.example","name":"alice",` +
 	`"role":"admin","status":"active",` +
@@ -50,7 +50,7 @@ func TestLoginReturnsTokensAndUser(t *testing.T) {
 		_, _ = w.Write([]byte(loginOKFixture))
 	}
 
-	client := mustNew(t, newStubServer(t, handler))
+	client := mustNew(t, newAPIServer(t, handler))
 
 	result, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
@@ -108,7 +108,7 @@ func TestLoginRejectsEmptyCredentials(t *testing.T) {
 				hit.Store(true)
 				w.WriteHeader(http.StatusInternalServerError)
 			}
-			client := mustNew(t, newStubServer(t, handler))
+			client := mustNew(t, newAPIServer(t, handler))
 
 			result, err := client.Login(t.Context(), tc.email, tc.password)
 
@@ -175,7 +175,7 @@ func TestLoginFailureTaxonomy(t *testing.T) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
 			}
-			client := mustNew(t, newStubServer(t, handler))
+			client := mustNew(t, newAPIServer(t, handler))
 
 			_, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
@@ -216,7 +216,7 @@ func TestRefreshExchangesTokens(t *testing.T) {
 		_, _ = w.Write([]byte(`{"access_token":"ACCESS-2","refresh_token":"ROTATED"}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler))
+	client := mustNew(t, newAPIServer(t, handler))
 
 	tokens, err := client.Refresh(t.Context(), "REFRESH-0")
 
@@ -267,7 +267,7 @@ func TestRefreshRejectedIsSessionExpired(t *testing.T) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
 			}
-			client := mustNew(t, newStubServer(t, handler))
+			client := mustNew(t, newAPIServer(t, handler))
 
 			_, err := client.Refresh(t.Context(), "REFRESH-0")
 
@@ -311,7 +311,7 @@ func TestLogoutRevokesAndEmptyIsNoOp(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		}
 
-		client := mustNew(t, newStubServer(t, handler))
+		client := mustNew(t, newAPIServer(t, handler))
 
 		if err := client.Logout(t.Context(), "REFRESH-0"); err != nil {
 			t.Fatalf("Logout() error = %v, want nil for 204 with empty body", err)
@@ -326,7 +326,7 @@ func TestLogoutRevokesAndEmptyIsNoOp(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 
-		client := mustNew(t, newStubServer(t, handler))
+		client := mustNew(t, newAPIServer(t, handler))
 
 		if err := client.Logout(t.Context(), ""); err != nil {
 			t.Fatalf("Logout() error = %v, want nil", err)

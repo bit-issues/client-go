@@ -15,7 +15,7 @@ import (
 	clientgo "github.com/bit-issues/client-go"
 )
 
-// projectFixture is the wire payload of GET /api/v1/projects/{slug}.
+// projectFixture is the wire payload of GET /projects/{slug}.
 const projectFixture = `{"id":"backend-service","name":"Backend Service",` +
 	`"repo_url":"https://bitbucket.org/company/backend",` +
 	`"created_at":"2026-04-01T08:00:00Z","updated_at":"2026-04-02T09:00:00Z"}`
@@ -55,7 +55,7 @@ func TestSessionUsesConstructorToken(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -122,7 +122,7 @@ func TestSessionRefreshesOnceOn401(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -172,7 +172,7 @@ func TestSessionSecond401IsUnauthorized(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -222,7 +222,7 @@ func TestSessionRefreshRejectedIsSessionExpired(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -265,7 +265,7 @@ func TestSessionRefreshServerErrorIsNotExpired(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -306,7 +306,7 @@ func TestSessionStaticStyleNeverRefreshes(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{AccessToken: "ACCESS-1"})
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{AccessToken: "ACCESS-1"})
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
@@ -348,7 +348,7 @@ func TestSessionTokensReflectRotation(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -397,7 +397,7 @@ func TestSessionLogoutRevokesAndClears(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-0",
 	})
@@ -467,7 +467,7 @@ func TestSessionLogoutWaitsForFlightAndRevokesRotatedToken(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "access-token-value",
 		RefreshToken: "refresh-token-value",
 	})
@@ -558,7 +558,7 @@ func TestSessionConcurrentLogoutIsSerialized(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "access-token-value",
 		RefreshToken: "refresh-token-value",
 	})
@@ -626,7 +626,7 @@ func TestSessionLogoutOwnershipIsCancellable(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "access-token-value",
 		RefreshToken: "refresh-token-value",
 	})
@@ -691,12 +691,12 @@ func TestSessionAuthPathWithoutLeadingSlash(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "ACCESS-1",
 		RefreshToken: "REFRESH-1",
 	})
 
-	err := session.Do(t.Context(), http.MethodPost, "api/v1/auth/login", nil, nil, nil)
+	err := session.Do(t.Context(), http.MethodPost, "auth/login", nil, nil, nil)
 	if !errors.Is(err, clientgo.ErrUnauthorized) {
 		t.Fatalf("Do() error = %v, want ErrUnauthorized", err)
 	}
@@ -749,7 +749,7 @@ func TestSessionConcurrentRefreshSingleFlight(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "access-token-value",
 		RefreshToken: "refresh-token-value",
 	})
@@ -821,7 +821,7 @@ func TestSessionRefreshLeaderCancellationDoesNotFailSharedFlight(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 		AccessToken:  "access-token-value",
 		RefreshToken: "refresh-token-value",
 	})
@@ -910,7 +910,7 @@ func TestSessionEmptyTokensIsLegal(t *testing.T) {
 		}
 	}
 
-	session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{})
+	session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{})
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
@@ -955,7 +955,7 @@ func TestErrorStringsLeakNoSecrets(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"invalid credentials"}`))
 		}
-		client := mustNew(t, newStubServer(t, handler))
+		client := mustNew(t, newAPIServer(t, handler))
 
 		_, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
@@ -969,7 +969,7 @@ func TestErrorStringsLeakNoSecrets(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"refresh token revoked"}`))
 		}
-		client := mustNew(t, newStubServer(t, handler))
+		client := mustNew(t, newAPIServer(t, handler))
 
 		_, err := client.Refresh(t.Context(), "REFRESH-0")
 
@@ -991,7 +991,7 @@ func TestErrorStringsLeakNoSecrets(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 			}
 		}
-		session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 			AccessToken:  "ACCESS-1",
 			RefreshToken: "REFRESH-0",
 		})
@@ -1016,7 +1016,7 @@ func TestErrorStringsLeakNoSecrets(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 			}
 		}
-		session := mustNewSession(t, newStubServer(t, handler), clientgo.Tokens{
+		session := mustNewSession(t, newAPIServer(t, handler), clientgo.Tokens{
 			AccessToken:  "ACCESS-1",
 			RefreshToken: "REFRESH-0",
 		})

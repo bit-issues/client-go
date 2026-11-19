@@ -24,6 +24,14 @@ func newStubServer(t *testing.T, handler http.HandlerFunc) string {
 	return srv.URL
 }
 
+// newAPIServer starts a stub HTTP server for handler and returns a base URL
+// that already carries the full API path, as a client behind a URL rewrite uses.
+func newAPIServer(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+
+	return newStubServer(t, handler) + "/api/v1"
+}
+
 // mustNew builds a client via clientgo.New and fails the test on error.
 func mustNew(t *testing.T, baseURL string, opts ...clientgo.Option) *clientgo.Client {
 	t.Helper()
@@ -40,7 +48,7 @@ func mustNew(t *testing.T, baseURL string, opts ...clientgo.Option) *clientgo.Cl
 func newTestClient(t *testing.T, handler http.HandlerFunc) *clientgo.Client {
 	t.Helper()
 
-	return mustNew(t, newStubServer(t, handler))
+	return mustNew(t, newAPIServer(t, handler))
 }
 
 // eventLog collects ordered events from HTTP handlers, refresh-token handler
@@ -296,7 +304,7 @@ func TestTransportErrorIsTyped(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.NotFoundHandler())
-	baseURL := srv.URL
+	baseURL := srv.URL + "/api/v1"
 	srv.Close()
 
 	client := mustNew(t, baseURL, clientgo.WithHTTPClient(&http.Client{

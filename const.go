@@ -2,14 +2,14 @@ package clientgo
 
 import "time"
 
-// REST endpoint paths, always appended to the configured base URL.
+// REST endpoint paths, always appended to the configured base URL. The base
+// URL carries the full path prefix, so the client adds none of its own.
 const (
-	pathPrefix      = "/api/v1"
-	pathProjects    = pathPrefix + "/projects"
-	pathTasks       = pathPrefix + "/tasks"
-	pathAuthLogin   = pathPrefix + "/auth/login"
-	pathAuthRefresh = pathPrefix + "/auth/refresh"
-	pathAuthLogout  = pathPrefix + "/auth/logout"
+	pathProjects    = "/projects"
+	pathTasks       = "/tasks"
+	pathAuthLogin   = "/auth/login"
+	pathAuthRefresh = "/auth/refresh"
+	pathAuthLogout  = "/auth/logout"
 )
 
 // Headers and credential formatting used on requests.

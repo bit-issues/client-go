@@ -13,8 +13,8 @@ import (
 )
 
 // ListTasksParams holds the optional REST query parameters of
-// GET /api/v1/tasks. Zero values are omitted from the query string so the
-// server-side defaults apply.
+// GET /tasks (appended to the configured base URL). Zero values are omitted
+// from the query string so the server-side defaults apply.
 type ListTasksParams struct {
 	// Limit maps to the "limit" query parameter (page size); 0 omits it.
 	Limit int
@@ -103,7 +103,7 @@ func requestURL(baseURL, path string, query url.Values) string {
 	return joined + "?" + query.Encode()
 }
 
-// taskPath returns the /api/v1/tasks/{id} path for a task ID.
+// taskPath returns the /tasks/{id} path for a task ID.
 func taskPath(id int64) string {
 	return pathTasks + "/" + strconv.FormatInt(id, 10)
 }

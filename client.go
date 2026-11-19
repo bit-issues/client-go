@@ -22,9 +22,11 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// New returns a client for baseURL; the /api/v1/... paths are always appended
-// to it. An empty or whitespace baseURL is rejected with ErrInvalidBaseURL
-// and New never panics.
+// New returns a client for baseURL; the endpoint paths are appended to it
+// verbatim. baseURL must contain the full path prefix (for example
+// https://host.example/api/v1), since the server may sit behind a URL rewrite.
+// An empty or whitespace baseURL is rejected with ErrInvalidBaseURL and New
+// never panics.
 func New(baseURL string, opts ...Option) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, ErrInvalidBaseURL

@@ -22,7 +22,7 @@ const (
 )
 
 // TestListProjects checks the base URL join (trailing slash tolerated), the
-// /api/v1 prefix, the bearer header and the decoded list payload.
+// full path carried by the base URL, the bearer header and the decoded list.
 func TestListProjects(t *testing.T) {
 	t.Parallel()
 
@@ -44,7 +44,7 @@ func TestListProjects(t *testing.T) {
 			`],"total":7}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler)+"/")
+	client := mustNew(t, newAPIServer(t, handler)+"/")
 
 	items, total, err := client.ListProjects(t.Context(), clientgo.Auth{AccessToken: "test-token"})
 
@@ -158,7 +158,7 @@ func TestListTasksSendsAllQueryParams(t *testing.T) {
 			`}],"total":1}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler))
+	client := mustNew(t, newAPIServer(t, handler))
 
 	params := clientgo.ListTasksParams{
 		Limit:      testListLimit,
@@ -361,7 +361,7 @@ func TestGetTaskDetails(t *testing.T) {
 }
 
 // TestBaseURLWithPathPrefix checks the join is clean when the base URL carries
-// a path prefix and a trailing slash.
+// a rewritten path prefix and a trailing slash.
 func TestBaseURLWithPathPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -374,7 +374,7 @@ func TestBaseURLWithPathPrefix(t *testing.T) {
 		_, _ = w.Write([]byte(`{"items":[],"total":0}`))
 	}
 
-	client := mustNew(t, newStubServer(t, handler)+"/bit/")
+	client := mustNew(t, newStubServer(t, handler)+"/bit/api/v1/")
 
 	_, _, err := client.ListProjects(t.Context(), clientgo.Auth{})
 
@@ -434,7 +434,7 @@ func TestGetProjectNotFound(t *testing.T) {
 	}
 }
 
-// taskDetailsFixture is the wire payload of GET /api/v1/tasks/{id}: the base
+// taskDetailsFixture is the wire payload of GET /tasks/{id}: the base
 // task fields plus project and attachments.
 const taskDetailsFixture = `{
 	"id": 42,
