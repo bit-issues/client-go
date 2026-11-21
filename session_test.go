@@ -663,6 +663,36 @@ func TestSessionLogoutOwnershipIsCancellable(t *testing.T) {
 	}
 }
 
+// TestSessionLogoutWithFreeGateAndCancelledContext checks that cancellation
+// wins even when the ownership gate is immediately available: no revoke, no
+// state change.
+func TestSessionLogoutWithFreeGateAndCancelledContext(t *testing.T) {
+	t.Parallel()
+
+	var revokeHits atomic.Int64
+	handler := func(w http.ResponseWriter, _ *http.Request) {
+		revokeHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}
+	tokens := clientgo.Tokens{AccessToken: "access-token-value"}
+	session := mustNewSession(t, newAPIServer(t, handler), tokens)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := session.Logout(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Logout() error = %v, want context.Canceled", err)
+	}
+	if got := revokeHits.Load(); got != 0 {
+		t.Errorf("revoke calls = %d, want 0", got)
+	}
+	if got := session.Tokens(); got != tokens {
+		t.Errorf("Tokens() = %+v, want unchanged %+v", got, tokens)
+	}
+}
+
 // TestSessionAuthPathWithoutLeadingSlash checks that a caller-supplied auth
 // endpoint is excluded from refresh/retry after path normalization.
 func TestSessionAuthPathWithoutLeadingSlash(t *testing.T) {

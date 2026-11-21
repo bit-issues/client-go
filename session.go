@@ -93,6 +93,10 @@ func (s *Session) Logout(ctx context.Context) (err error) {
 		return fmt.Errorf("logout ownership: %w", ctx.Err())
 	}
 
+	if err = ctx.Err(); err != nil {
+		return fmt.Errorf("logout ownership: %w", err)
+	}
+
 	s.mu.Lock()
 	s.loggedOut = true
 	flight := s.inflight
