@@ -1,4 +1,4 @@
-.PHONY: all version fmt lint test coverage benchmark air deps release clean build help
+.PHONY: all version fmt lint test coverage benchmark deps clean build help
 
 BINARY_NAME := $(shell basename $(PWD))
 GIT_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
@@ -27,28 +27,15 @@ coverage: test ## Generate coverage
 benchmark: ## Run benchmarks
 	go test -run=^$$ -bench=. -benchmem ./... | tee benchmark.txt
 
-air: ## Run development server
-	@command -v air >/dev/null 2>&1 || { \
-      echo "Please install air: go install github.com/air-verse/air@latest"; \
-      exit 1; \
-    }
-	@echo "Starting development server with air..."
-	TZ=UTC DEBUG=1 air
-
 deps: ## Install dependencies
 	go mod download
-
-release: ## Create release
-	goreleaser release --snapshot --clean
 
 clean: ## Clean build artifacts
 	rm -f coverage.* benchmark.txt
 	rm -rf dist bin
 
-build: ## Build the project
-	@echo "Building the project..."
-	@mkdir -p bin
-	go build -o bin/$(BINARY_NAME) .
+build: ## Compile all packages
+	go build ./...
 
 help: ## Show help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
