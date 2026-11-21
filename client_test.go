@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	clientgo "github.com/bit-issues/client-go"
+	"github.com/capcom6/go-restkit"
 )
 
 // Named values for mnd compliance in assertions and fixtures.
@@ -404,7 +405,8 @@ func TestEmptyBodyIsSuccess(t *testing.T) {
 	}
 }
 
-// TestGetProjectNotFound checks a 404 envelope becomes a typed ErrNotFound.
+// TestGetProjectNotFound checks a 404 becomes a restkit API error carrying
+// the status and the backend envelope.
 func TestGetProjectNotFound(t *testing.T) {
 	t.Parallel()
 
@@ -418,19 +420,22 @@ func TestGetProjectNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetProject() error = nil, want error")
 	}
-	if !errors.Is(err, clientgo.ErrNotFound) {
-		t.Errorf("errors.Is(err, ErrNotFound) = false, err = %v", err)
-	}
 
-	var apiErr *clientgo.APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("errors.As(*APIError) = false, err = %v", err)
+	apiErr, ok := restkit.AsAPIError(err)
+	if !ok {
+		t.Fatalf("restkit.AsAPIError(err) = false, err = %v", err)
 	}
 	if apiErr.StatusCode != http.StatusNotFound {
 		t.Errorf("APIError.StatusCode = %d, want %d", apiErr.StatusCode, http.StatusNotFound)
 	}
-	if apiErr.Message != "project not found" {
-		t.Errorf("APIError.Message = %q, want %q", apiErr.Message, "project not found")
+	var envelope struct {
+		Message string `json:"message"`
+	}
+	if perr := apiErr.ParseError(&envelope); perr != nil {
+		t.Fatalf("ParseError() error = %v", perr)
+	}
+	if envelope.Message != "project not found" {
+		t.Errorf("envelope.Message = %q, want %q", envelope.Message, "project not found")
 	}
 }
 

@@ -12,11 +12,10 @@ const (
 	pathAuthLogout  = "/auth/logout"
 )
 
-// Headers and credential formatting used on requests.
+// Credential header and formatting used on requests; go-restkit supplies the
+// Content-Type and Accept headers itself.
 const (
-	headerContentType   = "Content-Type"
 	headerAuthorization = "Authorization"
-	contentTypeJSON     = "application/json"
 	bearerScheme        = "Bearer "
 )
 

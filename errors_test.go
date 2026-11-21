@@ -1,8 +1,6 @@
 package clientgo_test
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -11,6 +9,7 @@ import (
 	"testing"
 
 	clientgo "github.com/bit-issues/client-go"
+	"github.com/capcom6/go-restkit"
 )
 
 // newStubServer starts a stub HTTP server for handler and returns its base URL.
@@ -77,8 +76,8 @@ func (l *eventLog) all() []string {
 }
 
 // TestErrorEnvelopeClassification locks the parsing of the backend error
-// envelope {message, code?} (which has NO "errors" field) into a typed
-// *APIError, including status classification into the sentinel errors.
+// envelope {message, code?} (which has NO "errors" field) via
+// restkit.APIError.ParseError, alongside restkit's status classification.
 func TestErrorEnvelopeClassification(t *testing.T) {
 	t.Parallel()
 
@@ -86,82 +85,67 @@ func TestErrorEnvelopeClassification(t *testing.T) {
 		name       string
 		status     int
 		body       string
-		wantSent   error
-		wantHelper func(error) bool
 		wantMsg    string
 		wantCode   int
+		wantClient bool
 	}{
 		{
 			name:       "400 validation without errors field",
 			status:     http.StatusBadRequest,
 			body:       `{"message":"title is required","code":400}`,
-			wantSent:   clientgo.ErrValidation,
-			wantHelper: clientgo.IsValidation,
 			wantMsg:    "title is required",
 			wantCode:   http.StatusBadRequest,
+			wantClient: true,
 		},
 		{
 			name:       "401 unauthorized without code",
 			status:     http.StatusUnauthorized,
 			body:       `{"message":"missing or expired token"}`,
-			wantSent:   clientgo.ErrUnauthorized,
-			wantHelper: clientgo.IsUnauthorized,
 			wantMsg:    "missing or expired token",
-			wantCode:   0,
+			wantClient: true,
 		},
 		{
 			name:       "403 inactive user",
 			status:     http.StatusForbidden,
 			body:       `{"message":"user account is not active","code":403}`,
-			wantSent:   clientgo.ErrForbidden,
-			wantHelper: clientgo.IsForbidden,
 			wantMsg:    "user account is not active",
 			wantCode:   http.StatusForbidden,
+			wantClient: true,
 		},
 		{
 			name:       "404 not found",
 			status:     http.StatusNotFound,
 			body:       `{"message":"project not found"}`,
-			wantSent:   clientgo.ErrNotFound,
-			wantHelper: clientgo.IsNotFound,
 			wantMsg:    "project not found",
-			wantCode:   0,
+			wantClient: true,
 		},
 		{
 			name:       "422 validation with details ignored",
 			status:     http.StatusUnprocessableEntity,
 			body:       `{"message":"invalid status value","code":422,"details":[{"field":"status"}]}`,
-			wantSent:   clientgo.ErrValidation,
-			wantHelper: clientgo.IsValidation,
 			wantMsg:    "invalid status value",
 			wantCode:   http.StatusUnprocessableEntity,
+			wantClient: true,
 		},
 		{
 			name:       "409 generic client error",
 			status:     http.StatusConflict,
 			body:       `{"message":"task already exists"}`,
-			wantSent:   clientgo.ErrClient,
-			wantHelper: clientgo.IsClientError,
 			wantMsg:    "task already exists",
-			wantCode:   0,
+			wantClient: true,
 		},
 		{
-			name:       "500 server error",
-			status:     http.StatusInternalServerError,
-			body:       `{"message":"Internal Server Error","code":500}`,
-			wantSent:   clientgo.ErrServer,
-			wantHelper: clientgo.IsServerError,
-			wantMsg:    "Internal Server Error",
-			wantCode:   http.StatusInternalServerError,
+			name:     "500 server error",
+			status:   http.StatusInternalServerError,
+			body:     `{"message":"Internal Server Error","code":500}`,
+			wantMsg:  "Internal Server Error",
+			wantCode: http.StatusInternalServerError,
 		},
 		{
-			name:       "503 server error without code",
-			status:     http.StatusServiceUnavailable,
-			body:       `{"message":"service unavailable"}`,
-			wantSent:   clientgo.ErrServer,
-			wantHelper: clientgo.IsServerError,
-			wantMsg:    "service unavailable",
-			wantCode:   0,
+			name:    "503 server error without code",
+			status:  http.StatusServiceUnavailable,
+			body:    `{"message":"service unavailable"}`,
+			wantMsg: "service unavailable",
 		},
 	}
 
@@ -180,126 +164,42 @@ func TestErrorEnvelopeClassification(t *testing.T) {
 				t.Fatal("GetProject() error = nil, want error")
 			}
 
-			var apiErr *clientgo.APIError
-			if !errors.As(err, &apiErr) {
-				t.Fatalf("errors.As(*APIError) = false, err = %v", err)
+			apiErr, ok := restkit.AsAPIError(err)
+			if !ok {
+				t.Fatalf("restkit.AsAPIError(err) = false, err = %v", err)
 			}
 			if apiErr.StatusCode != tc.status {
 				t.Errorf("APIError.StatusCode = %d, want %d", apiErr.StatusCode, tc.status)
 			}
-			if apiErr.Code != tc.wantCode {
-				t.Errorf("APIError.Code = %d, want %d", apiErr.Code, tc.wantCode)
-			}
-			if apiErr.Message != tc.wantMsg {
-				t.Errorf("APIError.Message = %q, want %q", apiErr.Message, tc.wantMsg)
-			}
-			if want := fmt.Sprintf("api error (status %d): %s", tc.status, tc.wantMsg); err.Error() != want {
-				t.Errorf("err.Error() = %q, want %q", err.Error(), want)
-			}
-			if !errors.Is(err, tc.wantSent) {
-				t.Errorf("errors.Is(err, %v) = false", tc.wantSent)
-			}
-			if !errors.Is(err, clientgo.ErrAPIError) {
-				t.Error("errors.Is(err, ErrAPIError) = false")
-			}
-			if !clientgo.IsAPIError(err) {
-				t.Error("IsAPIError(err) = false")
-			}
-			if !tc.wantHelper(err) {
-				t.Error("case helper(err) = false, want true")
-			}
 
-			wantClientErr := tc.status < http.StatusInternalServerError
-			if got := clientgo.IsClientError(err); got != wantClientErr {
-				t.Errorf("IsClientError(err) = %v, want %v", got, wantClientErr)
+			var envelope struct {
+				Message string `json:"message"`
+				Code    int    `json:"code,omitempty"`
 			}
-			if got := clientgo.IsServerError(err); got != !wantClientErr {
-				t.Errorf("IsServerError(err) = %v, want %v", got, !wantClientErr)
+			if perr := apiErr.ParseError(&envelope); perr != nil {
+				t.Fatalf("ParseError() error = %v", perr)
 			}
-		})
-	}
-}
-
-// TestAPIErrorMessageFallbacks covers bodies that carry no usable envelope
-// message: non-JSON payloads, empty bodies and JSON without a message.
-func TestAPIErrorMessageFallbacks(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   string
-	}{
-		{
-			name:   "non JSON body is used verbatim",
-			status: http.StatusBadGateway,
-			body:   "upstream exploded",
-			want:   "upstream exploded",
-		},
-		{
-			name:   "oversized non JSON body is truncated",
-			status: http.StatusBadGateway,
-			body:   strings.Repeat("a", 600),
-			want:   strings.Repeat("a", 512) + "...",
-		},
-		{
-			name:   "oversized multi-byte body is truncated on a rune boundary",
-			status: http.StatusServiceUnavailable,
-			body:   strings.Repeat("é", 600),
-			want:   strings.Repeat("é", 512) + "...",
-		},
-		{
-			name:   "empty body falls back to status text",
-			status: http.StatusInternalServerError,
-			body:   "",
-			want:   http.StatusText(http.StatusInternalServerError),
-		},
-		{
-			name:   "json object without message falls back to status text",
-			status: http.StatusInternalServerError,
-			body:   `{"code":500}`,
-			want:   http.StatusText(http.StatusInternalServerError),
-		},
-		{
-			name:   "blank message falls back to status text",
-			status: http.StatusBadGateway,
-			body:   `{"message":""}`,
-			want:   http.StatusText(http.StatusBadGateway),
-		},
-		{
-			name:   "whitespace only body falls back to status text",
-			status: http.StatusServiceUnavailable,
-			body:   " \n ",
-			want:   http.StatusText(http.StatusServiceUnavailable),
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(tc.body))
-			})
-
-			_, err := client.GetProject(t.Context(), clientgo.Auth{}, "any-project")
-
-			var apiErr *clientgo.APIError
-			if !errors.As(err, &apiErr) {
-				t.Fatalf("errors.As(*APIError) = false, err = %v", err)
+			if envelope.Message != tc.wantMsg {
+				t.Errorf("envelope.Message = %q, want %q", envelope.Message, tc.wantMsg)
 			}
-			if apiErr.Message != tc.want {
-				t.Errorf("APIError.Message = %q, want %q", apiErr.Message, tc.want)
+			if envelope.Code != tc.wantCode {
+				t.Errorf("envelope.Code = %d, want %d", envelope.Code, tc.wantCode)
+			}
+			if !restkit.IsAPIError(err) {
+				t.Error("restkit.IsAPIError(err) = false")
+			}
+			if got := restkit.IsClientError(err); got != tc.wantClient {
+				t.Errorf("restkit.IsClientError(err) = %v, want %v", got, tc.wantClient)
+			}
+			if got := restkit.IsServerError(err); got != !tc.wantClient {
+				t.Errorf("restkit.IsServerError(err) = %v, want %v", got, !tc.wantClient)
 			}
 		})
 	}
 }
 
 // TestTransportErrorIsTyped proves that a network failure leaves the client as
-// a typed ErrTransport error, never a bare transport error, and is not
-// classified as an API error.
+// a restkit infrastructure error and is not classified as an API error.
 func TestTransportErrorIsTyped(t *testing.T) {
 	t.Parallel()
 
@@ -316,21 +216,16 @@ func TestTransportErrorIsTyped(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetProject() error = nil, want transport error")
 	}
-	if !errors.Is(err, clientgo.ErrTransport) {
-		t.Errorf("errors.Is(err, ErrTransport) = false, err = %v", err)
+	if !restkit.IsInfrastructureError(err) {
+		t.Errorf("restkit.IsInfrastructureError(err) = false, err = %v", err)
 	}
-	if !clientgo.IsTransportError(err) {
-		t.Errorf("IsTransportError(err) = false, err = %v", err)
+	if !strings.Contains(err.Error(), "infrastructure error") {
+		t.Errorf("err.Error() = %q, want it to contain %q", err.Error(), "infrastructure error")
 	}
-	if !strings.Contains(err.Error(), "transport error") {
-		t.Errorf("err.Error() = %q, want it to contain %q", err.Error(), "transport error")
+	if restkit.IsAPIError(err) {
+		t.Errorf("restkit.IsAPIError(err) = true for a transport failure, err = %v", err)
 	}
-	if clientgo.IsAPIError(err) {
-		t.Errorf("IsAPIError(err) = true for a transport failure, err = %v", err)
-	}
-
-	var apiErr *clientgo.APIError
-	if errors.As(err, &apiErr) {
-		t.Errorf("errors.As(*APIError) = true for a transport failure: %+v", apiErr)
+	if _, ok := restkit.AsAPIError(err); ok {
+		t.Errorf("restkit.AsAPIError(err) = true for a transport failure, err = %v", err)
 	}
 }

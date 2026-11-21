@@ -5,21 +5,22 @@ package clientgo
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+
+	restkit "github.com/capcom6/go-restkit"
 )
 
 // Client is a STATELESS BitIssues REST API client: configuration is
 // immutable after construction, every read takes its credential explicitly
 // and the credential-exchange operations (Login, Refresh, Logout) are plain
 // in/out calls. A Client holds no token state - the stateful [Session]
-// wrapper does.
+// wrapper does. HTTP transport and failure classification come from
+// github.com/capcom6/go-restkit.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	rest *restkit.Client
 }
 
 // New returns a client for baseURL; the endpoint paths are appended to it
@@ -40,19 +41,25 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 		cfg.httpClient = &http.Client{}
 	}
 
-	return &Client{
-		baseURL:    baseURL,
-		httpClient: cfg.httpClient,
-	}, nil
+	rest, err := restkit.NewClient(restkit.Config{
+		BaseURL: baseURL,
+		Client:  cfg.httpClient,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create rest client: %w", err)
+	}
+
+	return &Client{rest: rest}, nil
 }
 
 // Do sends a request for path (joined onto the configured base URL) with the
 // optional query parameters and the bearer from auth. A JSON payload is sent
 // when payload is not nil and is decoded into response when response is not
 // nil and the response has a body; a 204 or empty body is a success without
-// any decode attempt. Any non-2xx response becomes a typed *APIError;
-// network failures wrap ErrTransport. The stateless client never refreshes -
-// a 401 is returned as-is; see [Session] for refresh-once semantics.
+// any decode attempt. HTTP failures are *restkit.APIError, network failures
+// are *restkit.InfrastructureError and request/decode failures are
+// *restkit.InternalError. The stateless client never refreshes - a 401 is
+// returned as-is; see [Session] for refresh-once semantics.
 func (c *Client) Do(
 	ctx context.Context,
 	auth Auth,
@@ -60,42 +67,47 @@ func (c *Client) Do(
 	query url.Values,
 	payload, response any,
 ) error {
-	status, body, err := c.roundTrip(ctx, method, requestURL(c.baseURL, path, query), payload, auth.AccessToken)
-	if err != nil {
-		return err
+	requestPath := path
+	if len(query) > 0 {
+		requestPath += "?" + query.Encode()
 	}
 
-	return finishResponse(status, body, response)
+	headers := http.Header{}
+	if auth.AccessToken != "" {
+		headers.Set(headerAuthorization, bearerScheme+auth.AccessToken)
+	}
+
+	if err := c.rest.Do(ctx, method, requestPath, headers, payload, response); err != nil {
+		return fmt.Errorf("api request failed: %w", err)
+	}
+
+	return nil
 }
 
 // Login exchanges email and password for a token pair plus the user profile.
 // Empty or whitespace arguments are rejected with ErrInvalidCredentials
 // before any request; the password travels only in the request body and
-// never enters an error string. Failure taxonomy: 401 -> ErrUnauthorized,
-// 403 (non-active account) -> ErrForbidden, 5xx -> server errors, network
-// failures -> ErrTransport.
+// never enters an error string. HTTP failures keep their restkit failure
+// classification with the status available through restkit.AsAPIError.
 func (c *Client) Login(ctx context.Context, email, password string) (LoginResult, error) {
 	if strings.TrimSpace(email) == "" || strings.TrimSpace(password) == "" {
 		return LoginResult{}, ErrInvalidCredentials
 	}
 
-	status, body, err := c.roundTrip(
+	var resp LoginResponse
+	if err := c.Do(
 		ctx,
+		Auth{AccessToken: ""},
 		http.MethodPost,
-		requestURL(c.baseURL, pathAuthLogin, nil),
+		pathAuthLogin,
+		nil,
 		LoginRequest{Email: email, Password: password},
-		"",
-	)
-	if err != nil {
+		&resp,
+	); err != nil {
 		return LoginResult{}, err
 	}
-
-	var resp LoginResponse
-	if decodeErr := finishResponse(status, body, &resp); decodeErr != nil {
-		return LoginResult{}, decodeErr
-	}
 	if resp.AccessToken == "" || resp.RefreshToken == "" {
-		return LoginResult{}, fmt.Errorf("%w: login response is missing a token", ErrUnauthorized)
+		return LoginResult{}, fmt.Errorf("%w: login response is missing a token", ErrInvalidResponse)
 	}
 
 	return LoginResult{
@@ -106,29 +118,28 @@ func (c *Client) Login(ctx context.Context, email, password string) (LoginResult
 
 // Refresh exchanges refreshToken for a rotated token pair (explicit in/out;
 // nothing is stored). A refresh token the backend rejects (401: revoked or
-// expired) is classified as ErrSessionExpired; 403, 5xx and transport
-// failures keep their existing sentinels. No token value enters the error.
+// expired) is classified as ErrSessionExpired; every other failure keeps its
+// restkit classification. No token value enters the error.
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (Tokens, error) {
-	status, body, err := c.roundTrip(
+	var pair RefreshResponse
+	err := c.Do(
 		ctx,
+		Auth{AccessToken: ""},
 		http.MethodPost,
-		requestURL(c.baseURL, pathAuthRefresh, nil),
+		pathAuthRefresh,
+		nil,
 		RefreshRequest{RefreshToken: refreshToken},
-		"",
+		&pair,
 	)
 	if err != nil {
+		if apiErr, ok := restkit.AsAPIError(err); ok && apiErr.StatusCode == http.StatusUnauthorized {
+			return Tokens{}, ErrSessionExpired
+		}
+
 		return Tokens{}, err
 	}
-	if status == http.StatusUnauthorized {
-		return Tokens{}, ErrSessionExpired
-	}
-
-	var pair RefreshResponse
-	if decodeErr := finishResponse(status, body, &pair); decodeErr != nil {
-		return Tokens{}, decodeErr
-	}
 	if pair.AccessToken == "" || pair.RefreshToken == "" {
-		return Tokens{}, fmt.Errorf("%w: refresh response is missing a token", ErrUnauthorized)
+		return Tokens{}, fmt.Errorf("%w: refresh response is missing a token", ErrInvalidResponse)
 	}
 
 	return Tokens(pair), nil
@@ -143,18 +154,15 @@ func (c *Client) Logout(ctx context.Context, refreshToken string) error {
 		return nil
 	}
 
-	status, body, err := c.roundTrip(
+	return c.Do(
 		ctx,
+		Auth{AccessToken: ""},
 		http.MethodPost,
-		requestURL(c.baseURL, pathAuthLogout, nil),
+		pathAuthLogout,
+		nil,
 		LogoutRequest{RefreshToken: refreshToken},
-		"",
+		nil,
 	)
-	if err != nil {
-		return err
-	}
-
-	return finishResponse(status, body, nil)
 }
 
 // ListProjects returns all projects and the total count reported by the API.
@@ -189,34 +197,6 @@ func (c *Client) GetTaskByNumber(ctx context.Context, auth Auth, slug string, nu
 // ID, including the project, comments and attachments.
 func (c *Client) GetTaskDetails(ctx context.Context, auth Auth, id int64) (*TaskDetailsResponse, error) {
 	return getTaskDetails(ctx, c.doWith(auth), id)
-}
-
-// roundTrip performs one HTTP exchange and returns the status code with the
-// fully read body; the response body is always closed.
-func (c *Client) roundTrip(
-	ctx context.Context,
-	method, urlStr string,
-	payload any,
-	accessToken string,
-) (int, []byte, error) {
-	req, err := newRequest(ctx, method, urlStr, payload, accessToken)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, nil, fmt.Errorf("%w: %w", ErrTransport, err)
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, fmt.Errorf("%w: failed to read response body: %w", ErrTransport, err)
-	}
-
-	return resp.StatusCode, body, nil
 }
 
 // doWith binds auth to Do, adapting it to the shared readFunc shape.
@@ -302,20 +282,6 @@ func getTaskDetails(ctx context.Context, do readFunc, id int64) (*TaskDetailsRes
 	}
 
 	return &details, nil
-}
-
-// finishResponse classifies a non-2xx response or decodes a success body; a
-// 204 and a nil response target succeed without any decode attempt.
-func finishResponse(status int, body []byte, response any) error {
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return parseAPIError(status, body)
-	}
-
-	if status == http.StatusNoContent || response == nil {
-		return nil
-	}
-
-	return decodeJSONBody(body, response)
 }
 
 // isAuthPath reports whether path is a public auth endpoint; the [Session]

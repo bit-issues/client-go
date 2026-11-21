@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	clientgo "github.com/bit-issues/client-go"
+	"github.com/capcom6/go-restkit"
 )
 
 // loginOKFixture is the wire payload of a successful POST /auth/login.
@@ -125,9 +126,8 @@ func TestLoginRejectsEmptyCredentials(t *testing.T) {
 	}
 }
 
-// TestLoginFailureTaxonomy checks the shared API error parsing for Login:
-// 401 -> ErrUnauthorized, 403 (non-active account) -> ErrForbidden,
-// 5xx -> server error.
+// TestLoginFailureTaxonomy checks that Login preserves the restkit status
+// classification: 401 and 403 are client errors, 5xx is a server error.
 func TestLoginFailureTaxonomy(t *testing.T) {
 	t.Parallel()
 
@@ -135,29 +135,24 @@ func TestLoginFailureTaxonomy(t *testing.T) {
 		name       string
 		status     int
 		body       string
-		wantSent   error
-		wantHelper func(error) bool
+		wantClient bool
 	}{
 		{
 			name:       "401 unauthorized",
 			status:     http.StatusUnauthorized,
 			body:       `{"message":"invalid credentials"}`,
-			wantSent:   clientgo.ErrUnauthorized,
-			wantHelper: clientgo.IsUnauthorized,
+			wantClient: true,
 		},
 		{
 			name:       "403 forbidden",
 			status:     http.StatusForbidden,
 			body:       `{"message":"user account is not active"}`,
-			wantSent:   clientgo.ErrForbidden,
-			wantHelper: clientgo.IsForbidden,
+			wantClient: true,
 		},
 		{
-			name:       "500 server error",
-			status:     http.StatusInternalServerError,
-			body:       `{"message":"boom"}`,
-			wantSent:   clientgo.ErrServer,
-			wantHelper: clientgo.IsServerError,
+			name:   "500 server error",
+			status: http.StatusInternalServerError,
+			body:   `{"message":"boom"}`,
 		},
 	}
 
@@ -179,11 +174,18 @@ func TestLoginFailureTaxonomy(t *testing.T) {
 
 			_, err := client.Login(t.Context(), "u@x.example", "pw-secret")
 
-			if !errors.Is(err, tc.wantSent) {
-				t.Fatalf("errors.Is(err, %v) = false, err = %v", tc.wantSent, err)
+			apiErr, ok := restkit.AsAPIError(err)
+			if !ok {
+				t.Fatalf("restkit.AsAPIError(err) = false, err = %v", err)
 			}
-			if !tc.wantHelper(err) {
-				t.Errorf("helper(err) = false, err = %v", err)
+			if apiErr.StatusCode != tc.status {
+				t.Errorf("APIError.StatusCode = %d, want %d", apiErr.StatusCode, tc.status)
+			}
+			if got := restkit.IsClientError(err); got != tc.wantClient {
+				t.Errorf("restkit.IsClientError(err) = %v, want %v", got, tc.wantClient)
+			}
+			if got := restkit.IsServerError(err); got != !tc.wantClient {
+				t.Errorf("restkit.IsServerError(err) = %v, want %v", got, !tc.wantClient)
 			}
 		})
 	}
@@ -233,7 +235,7 @@ func TestRefreshExchangesTokens(t *testing.T) {
 
 // TestRefreshRejectedIsSessionExpired checks a refresh token the backend
 // rejects (401) classifies as ErrSessionExpired - while a 5xx keeps the
-// transient ErrServer sentinel instead.
+// transient restkit server-error classification.
 func TestRefreshRejectedIsSessionExpired(t *testing.T) {
 	t.Parallel()
 
@@ -241,21 +243,18 @@ func TestRefreshRejectedIsSessionExpired(t *testing.T) {
 		name        string
 		status      int
 		body        string
-		wantSent    error
-		wantNotSent error
+		wantExpired bool
 	}{
 		{
-			name:     "401 rejected token is session expired",
-			status:   http.StatusUnauthorized,
-			body:     `{"message":"refresh token revoked"}`,
-			wantSent: clientgo.ErrSessionExpired,
+			name:        "401 rejected token is session expired",
+			status:      http.StatusUnauthorized,
+			body:        `{"message":"refresh token revoked"}`,
+			wantExpired: true,
 		},
 		{
-			name:        "500 stays a transient server error",
-			status:      http.StatusInternalServerError,
-			body:        `{"message":"boom"}`,
-			wantSent:    clientgo.ErrServer,
-			wantNotSent: clientgo.ErrSessionExpired,
+			name:   "500 stays a transient server error",
+			status: http.StatusInternalServerError,
+			body:   `{"message":"boom"}`,
 		},
 	}
 
@@ -271,14 +270,48 @@ func TestRefreshRejectedIsSessionExpired(t *testing.T) {
 
 			_, err := client.Refresh(t.Context(), "REFRESH-0")
 
-			if !errors.Is(err, tc.wantSent) {
-				t.Fatalf("errors.Is(err, %v) = false, err = %v", tc.wantSent, err)
+			if got := errors.Is(err, clientgo.ErrSessionExpired); got != tc.wantExpired {
+				t.Errorf("errors.Is(err, ErrSessionExpired) = %v, want %v, err = %v", got, tc.wantExpired, err)
 			}
-			if tc.wantNotSent != nil && errors.Is(err, tc.wantNotSent) {
-				t.Errorf("errors.Is(err, %v) = true, err = %v", tc.wantNotSent, err)
+			if !tc.wantExpired && !restkit.IsServerError(err) {
+				t.Errorf("restkit.IsServerError(err) = false, err = %v", err)
 			}
 		})
 	}
+}
+
+// TestMissingTokensAreInvalidResponse checks that a 2xx auth response without
+// the required tokens is reported as ErrInvalidResponse.
+func TestMissingTokensAreInvalidResponse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("login", func(t *testing.T) {
+		t.Parallel()
+
+		client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"user":{"id":1}}`))
+		})
+
+		_, err := client.Login(t.Context(), "u@x.example", "pw-secret")
+
+		if !errors.Is(err, clientgo.ErrInvalidResponse) {
+			t.Errorf("errors.Is(err, ErrInvalidResponse) = false, err = %v", err)
+		}
+	})
+
+	t.Run("refresh", func(t *testing.T) {
+		t.Parallel()
+
+		client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{}`))
+		})
+
+		_, err := client.Refresh(t.Context(), "REFRESH-0")
+
+		if !errors.Is(err, clientgo.ErrInvalidResponse) {
+			t.Errorf("errors.Is(err, ErrInvalidResponse) = false, err = %v", err)
+		}
+	})
 }
 
 // TestLogoutRevokesAndEmptyIsNoOp checks POST /api/v1/auth/logout: the 204

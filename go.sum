@@ -1,0 +1,4 @@
+github.com/capcom6/go-restkit v0.0.1 h1:9DJ1P+tuysfQhnR+uh/ZpIEX5wSUeVnuVgEz7h+4dW0=
+github.com/capcom6/go-restkit v0.0.1/go.mod h1:BHoGYPoKEzr6/yzv/40CL3lbjhD0Kwrpa0ILcAAyYYU=
+github.com/capcom6/go-restkit v0.0.2-0.20261121014703-0d0abd040420 h1:Z9aZ366n1LY2jtNwH74pqbD9KBOEIsF9D8vrFCOJJz4=
+github.com/capcom6/go-restkit v0.0.2-0.20261121014703-0d0abd040420/go.mod h1:BHoGYPoKEzr6/yzv/40CL3lbjhD0Kwrpa0ILcAAyYYU=

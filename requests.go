@@ -1,12 +1,6 @@
 package clientgo
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -92,51 +86,7 @@ func requestPath(path string) string {
 	return "/" + path
 }
 
-// requestURL joins the base URL, an API path and optional query parameters
-// without producing duplicate slashes.
-func requestURL(baseURL, path string, query url.Values) string {
-	joined := strings.TrimRight(baseURL, "/") + requestPath(path)
-	if len(query) == 0 {
-		return joined
-	}
-
-	return joined + "?" + query.Encode()
-}
-
 // taskPath returns the /tasks/{id} path for a task ID.
 func taskPath(id int64) string {
 	return pathTasks + "/" + strconv.FormatInt(id, 10)
-}
-
-// newRequest builds an HTTP request with a JSON body when payload is set and
-// the bearer credential when accessToken is not empty.
-func newRequest(
-	ctx context.Context,
-	method, urlStr string,
-	payload any,
-	accessToken string,
-) (*http.Request, error) {
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request payload: %w", err)
-		}
-
-		body = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	if body != nil {
-		req.Header.Set(headerContentType, contentTypeJSON)
-	}
-	if accessToken != "" {
-		req.Header.Set(headerAuthorization, bearerScheme+accessToken)
-	}
-
-	return req, nil
 }

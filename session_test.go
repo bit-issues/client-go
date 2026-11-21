@@ -13,6 +13,7 @@ import (
 	"time"
 
 	clientgo "github.com/bit-issues/client-go"
+	"github.com/capcom6/go-restkit"
 )
 
 // projectFixture is the wire payload of GET /projects/{slug}.
@@ -179,11 +180,9 @@ func TestSessionSecond401IsUnauthorized(t *testing.T) {
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
-	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
+	apiErr, ok := restkit.AsAPIError(err)
+	if !ok || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("API error = %v, want status 401, err = %v", apiErr, err)
 	}
 
 	got := events.all()
@@ -272,14 +271,11 @@ func TestSessionRefreshServerErrorIsNotExpired(t *testing.T) {
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
-	if !errors.Is(err, clientgo.ErrServer) {
-		t.Fatalf("errors.Is(err, ErrServer) = false, err = %v", err)
+	if !restkit.IsServerError(err) {
+		t.Fatalf("restkit.IsServerError(err) = false, err = %v", err)
 	}
 	if errors.Is(err, clientgo.ErrSessionExpired) {
 		t.Errorf("errors.Is(err, ErrSessionExpired) = true for a transient failure, err = %v", err)
-	}
-	if !clientgo.IsServerError(err) {
-		t.Errorf("IsServerError(err) = false, err = %v", err)
 	}
 }
 
@@ -310,11 +306,9 @@ func TestSessionStaticStyleNeverRefreshes(t *testing.T) {
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
-	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
+	apiErr, ok := restkit.AsAPIError(err)
+	if !ok || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("API error = %v, want status 401, err = %v", apiErr, err)
 	}
 	if got := events.all(); len(got) != 1 {
 		t.Errorf("events = %v, want exactly one401 and no retry", got)
@@ -697,8 +691,9 @@ func TestSessionAuthPathWithoutLeadingSlash(t *testing.T) {
 	})
 
 	err := session.Do(t.Context(), http.MethodPost, "auth/login", nil, nil, nil)
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("Do() error = %v, want ErrUnauthorized", err)
+	apiErr, ok := restkit.AsAPIError(err)
+	if !ok || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Do() error = %v, want 401 API error", err)
 	}
 	if got := refreshHits.Load(); got != 0 {
 		t.Errorf("refresh calls = %d, want 0 for an auth endpoint", got)
@@ -914,11 +909,9 @@ func TestSessionEmptyTokensIsLegal(t *testing.T) {
 
 	_, err := session.GetProject(t.Context(), "backend-service")
 
-	if !errors.Is(err, clientgo.ErrUnauthorized) {
-		t.Fatalf("errors.Is(err, ErrUnauthorized) = false, err = %v", err)
-	}
-	if !clientgo.IsUnauthorized(err) {
-		t.Errorf("IsUnauthorized(err) = false, err = %v", err)
+	apiErr, ok := restkit.AsAPIError(err)
+	if !ok || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("API error = %v, want status 401, err = %v", apiErr, err)
 	}
 }
 

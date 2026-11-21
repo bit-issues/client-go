@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+
+	restkit "github.com/capcom6/go-restkit"
 )
 
 // Session is the STATEFUL wrapper around a [Client]: it keeps BOTH tokens
@@ -28,7 +30,7 @@ type Session struct {
 // NewSession returns a Session for baseURL (validated exactly like New) that
 // starts from tokens - either pair may be empty: no access token means the
 // first read runs without a bearer, and no refresh token makes the session
-// static-style (401 is surfaced as ErrUnauthorized, refresh never attempted).
+// static-style (401 is surfaced as a restkit API error, refresh never attempted).
 // A refresh token the backend rejects mid-flight becomes ErrSessionExpired.
 func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error) {
 	client, err := New(baseURL, opts...)
@@ -51,8 +53,8 @@ func NewSession(baseURL string, tokens Tokens, opts ...Option) (*Session, error)
 // Do sends a request like [Client.Do] but injects the Session's current
 // access token. On a 401 the Session refreshes at most once (single-flight)
 // and retries the original request exactly once; a second 401 is returned as
-// ErrUnauthorized, and a rejected refresh token surfaces as ErrSessionExpired
-// without any retry.
+// a restkit API error, and a rejected refresh token surfaces as
+// ErrSessionExpired without any retry.
 func (s *Session) Do(
 	ctx context.Context,
 	method, path string,
@@ -170,12 +172,9 @@ func (s *Session) do(
 
 	gen, token := s.credentialState()
 
-	status, body, err := s.client.roundTrip(ctx, method, requestURL(s.client.baseURL, endpoint, query), payload, token)
-	if err != nil {
-		return err
-	}
-
-	if status == http.StatusUnauthorized && !retried && !isAuthPath(endpoint) {
+	err := s.client.Do(ctx, Auth{AccessToken: token}, method, endpoint, query, payload, response)
+	apiErr, isAPI := restkit.AsAPIError(err)
+	if isAPI && apiErr.StatusCode == http.StatusUnauthorized && !retried && !isAuthPath(endpoint) {
 		canRetry, refreshErr := s.refreshAfterUnauthorized(ctx, gen)
 		if refreshErr != nil {
 			return refreshErr
@@ -185,7 +184,7 @@ func (s *Session) do(
 		}
 	}
 
-	return finishResponse(status, body, response)
+	return err
 }
 
 // credentialState returns the generation of the in-memory access token and
@@ -199,8 +198,8 @@ func (s *Session) credentialState() (uint64, string) {
 
 // refreshAfterUnauthorized refreshes after a 401 (single-flight) and reports
 // whether the caller may retry its original request exactly once. Without an
-// in-memory refresh token (static-style session) it declines, so the caller
-// surfaces its original 401 as ErrUnauthorized instead; a failed refresh -
+// in-memory refresh token (static-style session) it declines, so the original
+// 401 API error is surfaced instead; a failed refresh -
 // ErrSessionExpired, a 5xx or a transport failure - propagates its typed
 // error and blocks the retry.
 func (s *Session) refreshAfterUnauthorized(ctx context.Context, gen uint64) (bool, error) {
