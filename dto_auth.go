@@ -53,3 +53,19 @@ type UserResponseDTO struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// RegisterRequest represents user registration data.
+//
+//	@Description	User registration request with email and password.
+type RegisterRequest struct {
+	Email    string `json:"email"    validate:"required,email"`
+	Password string `json:"password" validate:"required,min=8,max=72"`
+}
+
+// ChangePasswordRequest represents password change request.
+//
+//	@Description	Request to change user's password (requires old password for verification).
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password" validate:"required"`
+	NewPassword string `json:"new_password" validate:"required,min=8,max=72"`
+}
